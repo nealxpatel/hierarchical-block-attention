@@ -35,9 +35,15 @@ DESIGN CONSTRAINTS SATISFIED
     occurrences spread across the whole window) -- so the capability must
     generalize across distances rather than memorize one template (docs/training-
     recipe.md, "Format variation is required" / "Distance coverage").
-(b) Deterministic: every planting decision is a pure function of (base_seed, m, b).
-    No running state feeds the RNG, so a resume at any step reproduces identical
-    batches.
+(b) Deterministic: every planting decision is a pure function of (base_seed, g),
+    where g is the GLOBAL window index (see dist_util.global_window_index) --
+    NOT (m, b) separately, and not rank/world. No running state feeds the RNG,
+    so a resume at any step reproduces identical batches, AND a given window
+    plants identically regardless of which rank owns it or how many ranks the
+    world has (the multi-GPU shard-partition gate checks exactly this: same g
+    -> same plant on every rank). This IS a stream-identity change from a
+    single-process (m, b)-keyed RNG (see heal._sig's `stream_version`) -- it
+    has to be, since a per-rank key cannot be made world-size-invariant.
 (c) Reproducible + logged: FamMixer tracks fam_tok / real_tok / windows / fam_windows.
 
 LEAKAGE AVOIDANCE vs the eval probes (evals.induction_probe, evals.make_needle_batch).
@@ -79,6 +85,8 @@ reproduces.
 import numpy as np
 import torch
 
+from . import dist_util
+
 # separator token pool: a few fixed, valid (< vocab) ids used BETWEEN key and value.
 # Chosen to EXCLUDE the needle probe's SEP=2 (leakage avoidance) and to be
 # structurally distinct from the induction probe (which uses no separator at all).
@@ -113,8 +121,13 @@ class FamMixer:
         self.fam_windows = 0
         self.pairs_planted = 0
 
-    def _rng(self, m, b):
-        s = (self.seed * 2654435761 + m * 1000003 + b * 97 + 12345) & 0xFFFFFFFF
+    def _rng(self, g):
+        """Pure function of the GLOBAL window index g alone (see module
+        docstring, point (b)) -- no rank, no world, no local (m, b) split. This
+        is what makes a plant world-size-invariant: whichever rank happens to
+        own window g in a given (world, micro_B, accum) decomposition, it
+        derives the identical RNG stream and therefore the identical plant."""
+        s = (self.seed * 2654435761 + g * 1000003 + 12345) & 0xFFFFFFFF
         return np.random.default_rng(s)
 
     def _place_pair(self, row, occupied, rng, L, V):
@@ -174,11 +187,18 @@ class FamMixer:
                 npairs += 1
         return planted, npairs
 
-    def batch(self, m):
-        ids = self.stream.batch(m)                 # torch (B, ctx+1) int64
+    def batch(self, m, rank=0, world=1):
+        # world-size-invariant global window index -- calls
+        # dist_util.global_window_index directly (step=0, same call pattern as
+        # heal.WindowStream.batch) rather than re-deriving the g formula here a
+        # second time. At rank=0, world=1 this is g = m*B + b, bit-identical to
+        # the single-rank formula.
+        ids = self.stream.batch(m, rank=rank, world=world)   # torch (B, ctx+1) int64
         arr = ids.numpy().copy()
         for b in range(self.B):
-            rng = self._rng(m, b)
+            g = dist_util.global_window_index(step=0, micro=m, b=b, rank=rank,
+                                              world=world, micro_B=self.B, accum=1)
+            rng = self._rng(g)
             planted, npairs = self._plant(arr[b], rng)
             self.fam_tok += planted
             self.real_tok += arr.shape[1] - planted

@@ -16,6 +16,14 @@ Two layers, both documented in docs/training-recipe.md ("Correctness gates"):
 "Keep a naive reference oracle forever" and "refuse to start unless the gates are
 green" (docs/training-recipe.md) are hard rules -- these functions are the
 mechanism, not a suggestion.
+
+MULTI-GPU GATES (gate_shard_partition, gate_rank_consistency, gate_ddp_equivalence,
+gate_nccl_bandwidth, and check_training's aggregate-throughput extension) are the
+multi-GPU shakedown's own layer, run in addition to the above when launched under
+torchrun with world > 1 -- see scripts/shakedown.sh's multi-GPU mode and this
+module's `main`'s `--multi-gpu` flag. gate_shard_partition is pure Python (no GPU,
+no process group) and runs anywhere; the other three require an initialized
+torch.distributed process group (world > 1) to be meaningful.
 """
 
 import json
@@ -31,8 +39,10 @@ import torch
 from .attention import _route_candidates, hba_attention_dense, hba_attention_fused, rope_tables
 from .chunked_ce import chunked_cross_entropy, reference_cross_entropy
 from .config import (COMPUTE_DTYPE, DATA, DEVICE, INIT_PATH, REF_PATH, RESULTS, empty_cache, log,
-                     resolve_backend)
+                     resolve_backend, smoke_config)
+from .fam_data import FamMixer
 from .model import build_hba
+from . import dist_util
 
 REPORT = os.path.join(RESULTS, "shakedown_report.json")
 
@@ -397,6 +407,212 @@ def run_all_gates(model, tok, cfg):
     return ok
 
 
+# ------------------------------------------------------------ multi-GPU gates --
+def gate_shard_partition(cfg, world, micro_B, accum, K=5):
+    """Blocking (design: multi-GPU shakedown gate 3). PURE PYTHON -- no GPU, no
+    process group, no model -- so it runs anywhere, including in this repo's
+    CPU-only test suite. Enumerates the first K optimizer steps' g-indices
+    in-process for a given (world, micro_B, accum) and checks:
+
+      (a) SHARD PARTITION: at every one of the first K steps, every rank's
+          g-set (dist_util.rank_g_set) is pairwise DISJOINT from every other
+          rank's, and their union equals the world=1 enumeration's g-set
+          (dist_util.step_g_set) at the SAME windows_per_step -- i.e. every
+          window is consumed exactly once across the world, and the set of
+          windows a step consumes does not depend on how windows_per_step
+          happens to factor into (world, micro_B, accum). This is the gate
+          that would catch the "naive bug" the design calls out explicitly:
+          every rank silently seeing the SAME stream (accidentally passing
+          rank=0 everywhere) turns world GPUs into 1 effective GPU training on
+          duplicated data -- that bug fails this gate immediately (ranks'
+          g-sets would be identical, not disjoint).
+      (b) FAM-MIX PLANT IDENTITY: fam_data.FamMixer plants a fixed g
+          identically regardless of which rank owns it. FamMixer._rng(g)'s
+          plant is a pure function of (g, buffer length, vocab) -- not of the
+          pre-existing buffer content or of how g was reached -- so calling it
+          twice for the SAME g from two independent RNG draws must produce
+          byte-identical plants. No real WindowStream/model needed: only
+          FamMixer's own seed + cfg.vocab_size are exercised directly.
+    """
+    windows_per_step = dist_util.windows_per_step(world, micro_B, accum)
+    for step in range(K):
+        full = dist_util.step_g_set(step, world, micro_B, accum)
+        ref = dist_util.step_g_set(step, 1, windows_per_step, 1)
+        assert full == ref, (
+            f"[gate:shard-partition] step {step}: g-set (world={world}, micro_B={micro_B}, "
+            f"accum={accum}) != world=1 reference enumeration at the same windows_per_step "
+            f"({windows_per_step})"
+        )
+        parts = [dist_util.rank_g_set(step, world, micro_B, accum, r) for r in range(world)]
+        union = set().union(*parts)
+        assert union == full, f"[gate:shard-partition] step {step}: per-rank union != full g-set"
+        for i in range(world):
+            for j in range(i + 1, world):
+                assert parts[i].isdisjoint(parts[j]), (
+                    f"[gate:shard-partition] step {step}: rank {i} and rank {j} g-sets overlap "
+                    f"-- the naive duplication bug (every rank seeing the same stream)"
+                )
+
+    class _FakeStream:  # only .B is read by FamMixer.__init__; .batch is never called
+        def __init__(self, B):
+            self.B = B
+
+    fam = FamMixer(_FakeStream(1), cfg, seed=12345, frac=0.03)
+    L = 256
+    test_gs = sorted({0, 1, windows_per_step - 1, windows_per_step,
+                      windows_per_step * K - 1, windows_per_step * K})
+    for g in test_gs:
+        row_a, row_b = np.zeros(L, dtype=np.int64), np.zeros(L, dtype=np.int64)
+        planted_a, npairs_a = fam._plant(row_a, fam._rng(g))
+        planted_b, npairs_b = fam._plant(row_b, fam._rng(g))
+        assert np.array_equal(row_a, row_b) and planted_a == planted_b and npairs_a == npairs_b, (
+            f"[gate:shard-partition] g={g}: FamMixer plant not reproducible from g alone "
+            "(rank/world leaking into the RNG key)"
+        )
+    log(f"[gate:shard-partition] world={world} micro_B={micro_B} accum={accum} "
+        f"windows_per_step={windows_per_step}: {K}-step partition/union/invariance OK; "
+        f"FamMixer g-purity OK for {len(test_gs)} g values -> True")
+    return True
+
+
+def gate_rank_consistency(model, cfg, device=None, tol=1e-6):
+    """Blocking (design: multi-GPU shakedown gate 2). Broadcasts one fixed batch
+    (a fixed-seed random batch -- identical on every rank by construction, not
+    actually broadcast over the wire, since a fixed seed already IS the
+    broadcast) and verifies (a) every rank's own parameters are identical
+    (dist_util.assert_rank_consistent) and (b) every rank computes the same
+    loss on that batch, max spread <= `tol`. No-op True at world=1 (nothing to
+    check); requires an initialized process group with world > 1 to be
+    meaningful, i.e. this is a multi-GPU-only gate that cannot run in this
+    repo's CPU-only test suite (or in an environment without a GPU box)."""
+    if not dist_util.is_distributed():
+        log("[gate:rank-consistency] world=1 -- trivially OK")
+        return True
+    import torch.distributed as dist
+    dev = device or next(model.parameters()).device
+    spread = dist_util.assert_rank_consistent(model, dev, tol=tol, tag="[gate:rank-consistency:params]")
+
+    raw = dist_util.raw_model(model)
+    n = max(4 * cfg.window, 8 * cfg.block)
+    n = (n // cfg.block) * cfg.block
+    # Fixed seed -> byte-identical batch on every rank without any actual
+    # network broadcast; this IS "broadcast one fixed batch" (design gate 2's
+    # wording) for a synthetic input where the content only needs to be
+    # IDENTICAL across ranks, not drawn from real data.
+    g = torch.Generator(device="cpu").manual_seed(20260716)
+    ids = torch.randint(0, cfg.vocab_size, (1, n), generator=g).to(dev)
+    tgt = torch.randint(0, cfg.vocab_size, (1, n), generator=g).to(dev)
+    cos, sin = rope_tables(n, cfg.head_dim, cfg.rope_theta, dev)
+    was_training = raw.training
+    raw.eval()
+    with torch.no_grad(), strict_fp32():
+        logits = raw(ids, cos, sin, cfg.mem_elem_cap, mode="eval")
+        loss = torch.nn.functional.cross_entropy(
+            logits.float().reshape(-1, logits.shape[-1]), tgt.reshape(-1))
+    raw.train(was_training)
+    loss64 = loss.detach().to(torch.float64)
+    world = dist.get_world_size()
+    gathered = [torch.zeros_like(loss64) for _ in range(world)]
+    dist.all_gather(gathered, loss64)
+    vals = [float(x.item()) for x in gathered]
+    loss_spread = max(vals) - min(vals)
+    ok = loss_spread <= tol
+    log(f"[gate:rank-consistency] param spread={spread:.2e} fixed-batch loss spread="
+        f"{loss_spread:.2e} across {world} ranks (<= {tol} ? {ok})")
+    return ok
+
+
+def gate_nccl_bandwidth(size_gb=2.0, min_bus_gbs=6.0, device=None):
+    """Blocking (design: multi-GPU shakedown gate 7). All-reduces a ~size_gb
+    buffer and reports measured BUS bandwidth; aborts below `min_bus_gbs`
+    (consumer-GPU host-staged all-reduce -- no P2P -- realistically lands
+    6-12 GB/s; this microbench is the authority on the box's actual comm
+    reality, not a theoretical peak). GPU/NCCL-only in any meaningful sense --
+    no-op True at world=1."""
+    if not dist_util.is_distributed():
+        log("[gate:nccl-bw] world=1 -- trivially OK (nothing to all-reduce across)")
+        return True
+    result = dist_util.allreduce_bandwidth_microbench(size_gb=size_gb, device=device)
+    ok = result["bus_bw_gbs"] >= min_bus_gbs
+    log(f"[gate:nccl-bw] {size_gb}GB all-reduce across world={result['world']}: "
+        f"{result['seconds']:.3f}s bus_bw={result['bus_bw_gbs']:.2f}GB/s "
+        f"(>= {min_bus_gbs} ? {ok})")
+    return ok
+
+
+def gate_ddp_equivalence(cfg, world, micro_batch=1, steps=30, warmup=5, tol_loss=1e-3,
+                         tol_param=1e-5, phase="stage1"):
+    """Blocking (design: multi-GPU shakedown gate 4). GPU-ONLY orchestration --
+    cannot run in this repo's CPU-only test suite or without `world` real GPUs
+    -- so this is exercised on an actual multi-GPU box, not here.
+
+    Runs `steps` optimizer steps at world=`world` (via `torchrun --standalone
+    --nproc_per_node=world`) and at world=1 (plain `python`), both on a
+    SYNTHETIC short schedule (warmup=`warmup`, a compressed cosine decay over
+    `steps` steps -- `heal.py --warmup` override) at the SAME global tokens/
+    step, both `--smoke --shakedown --skip-gates` so the comparison is fast and
+    never touches the real corpus/checkpoint namespace. `warmup=5` over 30
+    steps (not the real phase's warmup=200) is required: 30 steps inside a real
+    warmup=200 would apply near-zero LR throughout and pass this gate
+    VACUOUSLY even with broken sharding (params barely move either way).
+
+    Two sub-checks, both must pass:
+      (a) loss trajectories match within `tol_loss` (~1e-3 -- fp reduction-
+          order noise only, under the registered comm_dtype for `phase`);
+      (b) post-run max|Δparam| between the two final checkpoints <= `tol_param`
+          (~1e-5) -- a trajectory can look right while a param SUBSET has
+          silently diverged (e.g. one rank's slice never actually trained).
+    """
+    import re
+    windows_per_step = 32  # matches heal.GLOBAL_TOKENS_PER_STEP // 4096 at ctx=4096
+    # `_run` below always launches with --smoke, so heal._heal_main builds cfg
+    # via config.smoke_config() (heal_ctx=512), NOT this function's own `cfg`
+    # (heal_ctx=4096, the real recipe config). The token budget MUST be sized
+    # off the ctx the subprocess actually trains at -- using the real cfg's
+    # heal_ctx here while the subprocess runs at the smoke ctx inflated
+    # total_steps by 4096/512 = 8x (~240 steps instead of the intended ~30),
+    # risking a timeout and accumulating 8x the fp-noise drift against
+    # tol_loss/tol_param.
+    tokens = steps * windows_per_step * smoke_config().heal_ctx
+    grad_accum_1gpu = windows_per_step // micro_batch
+    grad_accum_ngpu = windows_per_step // (micro_batch * world)
+    assert grad_accum_1gpu * micro_batch == windows_per_step, "micro_batch must divide windows_per_step"
+    assert grad_accum_ngpu * micro_batch * world == windows_per_step, (
+        f"micro_batch={micro_batch} world={world} does not divide windows_per_step={windows_per_step}")
+
+    def _run(env_extra, launcher, ckpt_suffix, grad_accum):
+        env = dict(os.environ, HBA_RESULTS_DIR=os.path.join(RESULTS, f"_ddp_gate_{ckpt_suffix}"))
+        env.update(env_extra)
+        os.makedirs(env["HBA_RESULTS_DIR"], exist_ok=True)
+        cmd = launcher + ["-m", "hba.heal", "--phase", phase, "--smoke", "--shakedown",
+                          "--skip-gates", "--tokens", str(tokens), "--warmup", str(warmup),
+                          "--micro-batch", str(micro_batch), "--grad-accum", str(grad_accum)]
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=1800)
+        losses = [float(m) for m in re.findall(r" lm (-?[\d.]+) ppl", r.stdout)]
+        ckpt = os.path.join(env["HBA_RESULTS_DIR"], f"heal_{phase}_smoke.pt")
+        return losses, ckpt, r
+
+    losses_1, ckpt_1, r1 = _run({}, [sys.executable], "1gpu", grad_accum_1gpu)
+    losses_n, ckpt_n, rn = _run({}, ["torchrun", "--standalone", f"--nproc_per_node={world}"],
+                                "ngpu", grad_accum_ngpu)
+    if not (os.path.exists(ckpt_1) and os.path.exists(ckpt_n)):
+        log(f"[gate:ddp-equiv] FAILED: checkpoint(s) missing -- world=1 stdout tail:\n"
+            f"{r1.stdout[-2000:]}\n{r1.stderr[-2000:]}\nworld={world} stdout tail:\n"
+            f"{rn.stdout[-2000:]}\n{rn.stderr[-2000:]}")
+        return False
+    n_cmp = min(len(losses_1), len(losses_n))
+    loss_ok = n_cmp > 0 and max(abs(a - b) for a, b in zip(losses_1[:n_cmp], losses_n[:n_cmp])) < tol_loss
+    ck1 = torch.load(ckpt_1, map_location="cpu")["model"]
+    ckn = torch.load(ckpt_n, map_location="cpu")["model"]
+    max_dparam = max(float((ck1[k].float() - ckn[k].float()).abs().max()) for k in ck1)
+    param_ok = max_dparam <= tol_param
+    ok = loss_ok and param_ok
+    log(f"[gate:ddp-equiv] world=1 vs world={world}, {steps} steps (warmup={warmup}): "
+        f"loss_ok={loss_ok} (n_cmp={n_cmp}, tol={tol_loss}) max|Δparam|={max_dparam:.2e} "
+        f"(<= {tol_param} ? {param_ok}) -> {ok}")
+    return ok
+
+
 # --------------------------------------------------------------- shakedown -----
 def check_reference(cfg, report):
     """fp32 (tight) and bf16 (loose) HBA-equiv logits vs a shipped fp32 reference
@@ -489,7 +705,7 @@ def check_gates(cfg, report):
     del m; empty_cache()
 
 
-def check_training(cfg, planned_tps, steps, report, fast=False):
+def check_training(cfg, planned_tps, steps, report, fast=False, rank=0, world=1, local_rank=0):
     """N steps of stage 1; loss falls, aux-KL moves, tok/s measured; checkpoint
     write + reload-resume verified in a fresh process.
 
@@ -498,7 +714,34 @@ def check_training(cfg, planned_tps, steps, report, fast=False):
     tok/s measurement window excludes the first ~10 steps (compile/autotune
     warmup -- see heal.train's warmup_steps) so a 50-step average isn't
     dominated by one-time kernel autotune cost the way a naive average would
-    be. Guarded so warmup_steps < steps even at very small --steps overrides."""
+    be. Guarded so warmup_steps < steps even at very small --steps overrides.
+
+    rank/world/local_rank: multi-GPU shakedown mode (design gate 5, "doubles as
+    a scaling-efficiency gate"). Defaults (0/1/0) reproduce the single-GPU
+    check exactly. At world > 1 (this process is one of `world` ranks already
+    initialized under torchrun -- see gates.main's --multi-gpu flag), this
+    rank's own measured tok/s is all-reduced (SUM) into an aggregate, compared
+    against PLANNED_TPS * world at a 0.75 scaling-efficiency threshold instead
+    of the single-GPU 0.7 floor (consumer-GPU host-staged all-reduce overhead
+    means aggregate throughput never scales perfectly linearly; 0.75 is the
+    floor below which the multi-GPU run isn't worth its added complexity).
+
+    Per-rank measurement (design fix): heal.log's per-step status line is
+    rank-0-only (avoids world-way duplicate spam -- see heal.train's Logging
+    note), so monkeypatching heal.log to harvest tok/s -- as an EARLIER version
+    of this function did -- silently collects NOTHING on ranks != 0: their
+    run_shakedown would return False structurally, and rank 0's SUM all-reduce
+    over [tps0, 0, 0, ...] would land scaling_efficiency near 1/world always,
+    regardless of real throughput. Fixed by passing train() a `tps_out` dict
+    (its own rank-agnostic recording channel -- see train()'s docstring): every
+    rank reads its OWN measured series back from tps_out after train() returns,
+    independent of which rank calls log(). loss_falls/aux_moves, by contrast,
+    ARE only observable via the log line (they need the actual loss/aux
+    values, not just tok/s) -- so those stay rank-0-only and are BROADCAST from
+    rank 0 to every other rank below, so every rank's pass/fail verdict agrees
+    (previously, ranks != 0 would independently see empty loss/aux lists and
+    fail on data they could never structurally have collected -- exactly the
+    inconsistent-exit failure mode this fixes)."""
     from .heal import PHASES, train
     from . import heal
     if not os.path.exists(os.path.join(DATA, "train.bin")):
@@ -513,11 +756,20 @@ def check_training(cfg, planned_tps, steps, report, fast=False):
         if torch.cuda.is_available() else "1"
     _mb = int(os.environ.get("HEAL_MICRO", _default_mb))
     _ga = int(os.environ.get("HEAL_ACCUM", str(max(1, 32 // _mb) if _mb >= 8 else max(1, 4 // _mb))))
-    PHASES["stage1"]["tokens"] = steps * _mb * _ga * cfg.heal_ctx
+    # * world: this mini-run's token budget must scale with world size too, or
+    # (at world > 1) train()'s tokens_per_step (which DOES include world --
+    # micro_batch*grad_accum*ctx*world) divides a world-blind numerator down to
+    # ~1/world the intended optimizer steps -- at world=8 that can put total
+    # steps below the fast profile's warmup_steps=10, so the tok/s measurement
+    # window (which resets AFTER warmup_steps) never even opens.
+    PHASES["stage1"]["tokens"] = steps * _mb * _ga * cfg.heal_ctx * world
     t0 = time.time()
     # Run in-process for the measurement; capture the loss trace via a light
-    # monkeypatch on log rather than parsing files.
-    losses, auxes, tps_seen = [], [], []
+    # monkeypatch on log rather than parsing files. This DOES stay rank-0-only
+    # (heal.log's status line only fires there) -- see the per-rank tps_out
+    # channel above for the part of this measurement that must work on every
+    # rank.
+    losses, auxes = [], []
     orig = heal.log
 
     def cap(*a):
@@ -527,17 +779,18 @@ def check_training(cfg, planned_tps, steps, report, fast=False):
             try:
                 losses.append(float(s.split(" lm ")[1].split()[0]))
                 auxes.append(float(s.split(" aux ")[1].split()[0]))
-                tps_seen.append(float(s.split(" tok/s ")[1].split()[0]))
             except Exception:
                 pass
     heal.log = cap
+    tps_out = {}
     try:
         # shakedown=True waives heal's smoke-shard/corpus-size data guards: this
         # mini stage legitimately trains on a small data slice. The guards stay
         # fully armed for any real heal invocation (scripts/heal.sh never passes
         # --shakedown).
         train(cfg, "stage1", resume=False, micro_batch=_mb, grad_accum=_ga,
-              budget_s=1800, smoke=(DEVICE != "cuda"), shakedown=True, warmup_steps=warmup_steps)
+              budget_s=1800, smoke=(DEVICE != "cuda"), shakedown=True, warmup_steps=warmup_steps,
+              rank=rank, world=world, local_rank=local_rank, tps_out=tps_out)
     finally:
         heal.log = orig
     # train()'s model/optimizer are freed on return, but the caching allocator
@@ -547,44 +800,94 @@ def check_training(cfg, planned_tps, steps, report, fast=False):
     # released first.
     empty_cache()
     dt = time.time() - t0
-    tps = max(tps_seen) if tps_seen else 0.0
+    # THIS rank's own measured tok/s, read from tps_out -- NOT parsed from
+    # heal.log (see the per-rank measurement note above).
+    tps_series = tps_out.get("series", [])
+    tps = max(tps_series) if tps_series else 0.0
     loss_falls = len(losses) >= 2 and losses[-1] < losses[0] + 0.05    # tolerate noise
     aux_moves = len(auxes) >= 2 and abs(auxes[-1] - auxes[0]) > 1e-4
-    fast_enough = tps >= 0.7 * planned_tps if planned_tps > 0 else True
+    agg_tps, eff = tps, None
+    if world > 1 and dist_util.is_distributed():
+        import torch.distributed as dist
+        t = torch.tensor([tps], dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        agg_tps = float(t.item())
+        target = planned_tps * world
+        eff = (agg_tps / target) if target > 0 else 1.0
+        fast_enough = eff >= 0.75
+        # loss_falls/aux_moves are only OBSERVABLE on rank 0 (derived from
+        # heal.log's rank-0-only status line -- see the docstring note above);
+        # broadcast rank 0's verdict so every rank's report/exit code agrees,
+        # instead of ranks != 0 failing on structurally-empty local data.
+        verdict = torch.tensor([1.0 if loss_falls else 0.0, 1.0 if aux_moves else 0.0],
+                               dtype=torch.float64)
+        dist.broadcast(verdict, src=0)
+        loss_falls, aux_moves = bool(verdict[0].item()), bool(verdict[1].item())
+    else:
+        fast_enough = tps >= 0.7 * planned_tps if planned_tps > 0 else True
     ok = loss_falls and aux_moves and (fast_enough or DEVICE != "cuda")
     report["training"] = dict(ok=bool(ok), loss0=losses[0] if losses else None,
                               lossN=losses[-1] if losses else None, loss_falls=bool(loss_falls),
                               aux0=auxes[0] if auxes else None, auxN=auxes[-1] if auxes else None,
-                              aux_moves=bool(aux_moves), tok_s=tps, planned_tps=planned_tps,
+                              aux_moves=bool(aux_moves), tok_s=tps, agg_tok_s=agg_tps, world=world,
+                              scaling_efficiency=eff, planned_tps=planned_tps,
                               fast_enough=bool(fast_enough), wall_s=dt)
     log(f"[shake:train] loss {report['training']['loss0']}->{report['training']['lossN']} "
         f"aux {report['training']['aux0']}->{report['training']['auxN']} tok/s {tps:.0f} "
-        f"(planned {planned_tps}) -> {ok}")
+        f"agg_tok/s {agg_tps:.0f} (world={world}, planned {planned_tps}"
+        f"{f', eff={eff:.2f}' if eff is not None else ''}) -> {ok}")
     if planned_tps > 0 and DEVICE == "cuda" and not fast_enough:
-        log(f"[shake:train] *** ABORT-WORTHY: measured {tps:.0f} tok/s < 70% of planned "
-            f"{planned_tps} -- the plan's wall-clock/cost arithmetic will not hold ***")
+        log(f"[shake:train] *** ABORT-WORTHY: measured throughput below the "
+            f"{'75% scaling-efficiency' if world > 1 else '70% of planned'} floor -- the plan's "
+            "wall-clock/cost arithmetic will not hold ***")
 
-    # checkpoint write + reload-resume (separate process to prove on-box durability)
+    # checkpoint write + reload-resume (separate process to prove on-box
+    # durability). RANK-0 ONLY: under torchrun every rank inherits RANK/
+    # WORLD_SIZE/LOCAL_RANK/MASTER_ADDR/MASTER_PORT/TORCHELASTIC_*/GROUP_RANK/
+    # ROLE_* env vars, so a subprocess spawned from EVERY rank would each try
+    # to join the parent's already-live rendezvous (hang or collision) instead
+    # of starting its own independent single-process run; and every rank's
+    # os.replace(ck, shadow) below would race on the SAME file (FileNotFoundError
+    # on N-1 ranks once the first one wins the rename). So: rank 0 alone runs
+    # the subprocess (with a scrubbed env so it truly launches standalone, not
+    # as a phantom member of this torchrun job) and does the shadow/replace;
+    # every other rank waits at a barrier and then takes rank 0's broadcast
+    # verdict, so all ranks agree on report["resume"]["ok"] and exit
+    # consistently.
     suffix = "_smoke" if DEVICE != "cuda" else ""
     ck = os.path.join(RESULTS, f"heal_stage1{suffix}.pt")
-    resume_ok = os.path.exists(ck)
-    if resume_ok:
-        r = subprocess.run([sys.executable, "-m", "hba.heal",
-                            "--phase", "stage1", "--resume", "--skip-gates", "--shakedown",
-                            "--tokens", str(PHASES["stage1"]["tokens"]),
-                            "--micro-batch", "1", "--grad-accum", "4"]
-                           + (["--smoke"] if DEVICE != "cuda" else []),
-                           capture_output=True, text=True, timeout=600)
-        resume_ok = ("resuming from step" in r.stdout or "already complete" in r.stdout)
+    resume_ok = False
+    if rank == 0:
+        resume_ok = os.path.exists(ck)
+        if resume_ok:
+            _scrub_exact = {"RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE",
+                            "MASTER_ADDR", "MASTER_PORT", "GROUP_RANK"}
+            env = {k: v for k, v in os.environ.items()
+                  if k not in _scrub_exact and not k.startswith("TORCHELASTIC_")
+                  and not k.startswith("ROLE_")}
+            r = subprocess.run([sys.executable, "-m", "hba.heal",
+                                "--phase", "stage1", "--resume", "--skip-gates", "--shakedown",
+                                "--tokens", str(PHASES["stage1"]["tokens"]),
+                                "--micro-batch", "1", "--grad-accum", "4"]
+                               + (["--smoke"] if DEVICE != "cuda" else []),
+                               capture_output=True, text=True, timeout=600, env=env)
+            resume_ok = ("resuming from step" in r.stdout or "already complete" in r.stdout)
+        # move the mini-run ckpt ASIDE (rank-0-only, same reasoning as above):
+        # it must never be mistaken for real healing output (the ckpt signature
+        # also embeds the token budget, but a real-named heal_stage1.pt on disk
+        # left over from a shakedown is a foot-gun).
+        if os.path.exists(ck):
+            shadow = os.path.join(RESULTS, f"heal_stage1{suffix}_shakedown.pt")
+            os.replace(ck, shadow)
+            log(f"[shake:train] shakedown mini-ckpt moved aside -> {shadow}")
+    dist_util.barrier()
+    if world > 1 and dist_util.is_distributed():
+        import torch.distributed as dist
+        v = torch.tensor([1.0 if resume_ok else 0.0], dtype=torch.float64)
+        dist.broadcast(v, src=0)
+        resume_ok = bool(v.item())
     report["resume"] = dict(ok=bool(resume_ok))
     log(f"[shake:resume] checkpoint reload-resume -> {resume_ok}")
-    # move the mini-run ckpt ASIDE: it must never be mistaken for real healing
-    # output (the ckpt signature also embeds the token budget, but a real-named
-    # heal_stage1.pt on disk left over from a shakedown is a foot-gun).
-    if os.path.exists(ck):
-        shadow = os.path.join(RESULTS, f"heal_stage1{suffix}_shakedown.pt")
-        os.replace(ck, shadow)
-        log(f"[shake:train] shakedown mini-ckpt moved aside -> {shadow}")
 
 
 def check_eval(cfg, report, fast=False):
@@ -613,7 +916,8 @@ def check_eval(cfg, report, fast=False):
     log(f"[shake:eval] fast={fast} {det}")
 
 
-def run_shakedown(cfg, planned_tps=5000.0, steps=150, stage="all", fast=False):
+def run_shakedown(cfg, planned_tps=5000.0, steps=150, stage="all", fast=False,
+                  rank=0, world=1, local_rank=0):
     """Run the pre-flight shakedown and write REPORT. Returns the overall bool.
 
     fast=True is the provisioning entrypoint's fast profile (scripts/
@@ -623,28 +927,68 @@ def run_shakedown(cfg, planned_tps=5000.0, steps=150, stage="all", fast=False):
     (check_eval). The fine-grained fp32 gates + G1 induction (check_gates) and
     the reference check (check_reference) are unchanged by fast -- they are
     already fast (~4 min combined) and are exactly the correctness surface
-    that must never be skipped before any training runs on a new box."""
-    log(f"shakedown device={DEVICE} dtype={COMPUTE_DTYPE} planned_tps={planned_tps} fast={fast}")
+    that must never be skipped before any training runs on a new box.
+
+    rank/world/local_rank: multi-GPU mode (world > 1, called under torchrun by
+    scripts/shakedown.sh's multi-GPU path / gates.main's --multi-gpu). Adds the
+    gate_shard_partition / gate_rank_consistency / gate_nccl_bandwidth checks
+    (gate_ddp_equivalence is run SEPARATELY by the shell wrapper, not here --
+    it orchestrates its OWN torchrun/python subprocess pair and must not be
+    invoked recursively from inside an already-running torchrun rank) and
+    threads rank/world into check_training for the aggregate-throughput /
+    scaling-efficiency extension. Defaults (0/1/0) are the single-GPU path,
+    unchanged from before this mode existed. Only rank 0 writes REPORT (design:
+    "rank 0 writes" convention applied consistently to every collective
+    artifact this module produces, not just heal.py's checkpoints)."""
+    log(f"shakedown device={DEVICE} dtype={COMPUTE_DTYPE} planned_tps={planned_tps} fast={fast} "
+        f"rank={rank}/{world}")
     report = dict(device=DEVICE, torch=torch.__version__,
-                  cuda=torch.cuda.get_device_name(0) if DEVICE == "cuda" else None, ts=time.time())
+                  cuda=torch.cuda.get_device_name(0) if DEVICE == "cuda" else None, ts=time.time(),
+                  world=world)
     if stage in ("all", "ref"):
         check_reference(cfg, report)
     if stage in ("all", "gates"):
         check_gates(cfg, report)
+        if world > 1:
+            # gate 1 (per-rank correctness) is already satisfied structurally --
+            # check_gates above runs identically in every rank's own process.
+            # windows_per_step=32 matches GLOBAL_TOKENS_PER_STEP // heal_ctx at the
+            # default 4096 ctx (see heal.GLOBAL_TOKENS_PER_STEP); world in {1,2,4,8}
+            # always divides it evenly.
+            report["shard_partition"] = dict(
+                ok=bool(gate_shard_partition(cfg, world, micro_B=1, accum=32 // world)))
+            m, _, _ = build_hba(cfg, dtype=torch.float32)
+            # gate_rank_consistency MUST run on the UNWRAPPED model: DDP's
+            # constructor broadcasts rank-0's params to every rank, so wrapping
+            # FIRST (as this used to do) makes the gate's own param-spread check
+            # trivially pass (spread=0 by construction) regardless of whether
+            # this box's own checkpoint/weight load was actually torn on some
+            # rank -- exactly the failure mode the gate exists to catch. Gate
+            # first, wrap after (wrap_ddp itself is still exercised here; its
+            # result is otherwise unused for this check).
+            report["rank_consistency"] = dict(ok=bool(gate_rank_consistency(m, cfg)))
+            if dist_util.is_distributed():
+                m = dist_util.wrap_ddp(m, local_rank, "fp32")
+            del m; empty_cache()
+            report["nccl_bandwidth"] = dict(ok=bool(gate_nccl_bandwidth(
+                device=DEVICE if DEVICE == "cuda" else None)))
     if stage in ("all", "train"):
-        check_training(cfg, planned_tps, steps, report, fast=fast)
+        check_training(cfg, planned_tps, steps, report, fast=fast,
+                       rank=rank, world=world, local_rank=local_rank)
     if stage in ("all", "eval"):
         check_eval(cfg, report, fast=fast)
 
     checks = {k: v for k, v in report.items() if isinstance(v, dict) and "ok" in v}
     overall = all(v["ok"] for v in checks.values())
     report["PASS"] = bool(overall)
-    json.dump(report, open(REPORT + ".tmp", "w"), indent=2)
-    os.replace(REPORT + ".tmp", REPORT)
-    banner = "=" * 60
-    print(f"\n{banner}\nSHAKEDOWN {'PASS' if overall else 'FAIL'}  ("
-          + ", ".join(f"{k}={'ok' if v['ok'] else 'FAIL'}" for k, v in checks.items())
-          + f")\nreport -> {REPORT}\n{banner}", flush=True)
+    if rank == 0:
+        json.dump(report, open(REPORT + ".tmp", "w"), indent=2)
+        os.replace(REPORT + ".tmp", REPORT)
+        banner = "=" * 60
+        print(f"\n{banner}\nSHAKEDOWN {'PASS' if overall else 'FAIL'}  ("
+              + ", ".join(f"{k}={'ok' if v['ok'] else 'FAIL'}" for k, v in checks.items())
+              + f")\nreport -> {REPORT}\n{banner}", flush=True)
+    dist_util.barrier()
     return overall
 
 
@@ -654,7 +998,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--planned-tps", type=float, default=5000.0,
                     help="planned healing tok/s (see the training-recipe cost notes); abort if "
-                         "measured throughput is under 70pct of this on CUDA")
+                         "measured throughput is under 70pct of this on CUDA (or under a 75% "
+                         "scaling-efficiency floor at world > 1 -- see check_training)")
     ap.add_argument("--steps", type=int, default=None,
                     help="default: 50 with --fast, else 150")
     ap.add_argument("--stage", choices=["all", "ref", "gates", "train", "eval"], default="all")
@@ -662,11 +1007,20 @@ def main():
                     help="provisioning fast profile (scripts/provision.sh): 50 measured train "
                          "steps with the tok/s window excluding compile/autotune warmup, one "
                          "PPL eval cell instead of PPL+needle. See docker/README.md.")
+    ap.add_argument("--multi-gpu", action="store_true",
+                    help="run under torchrun (scripts/shakedown.sh's multi-GPU mode): adds "
+                         "gate_shard_partition/gate_rank_consistency/gate_nccl_bandwidth and the "
+                         "aggregate-throughput extension to check_training. No-op (identical to "
+                         "single-GPU) if not actually launched under torchrun.")
     args = ap.parse_args()
     cfg = HBAConfig()
     steps = args.steps if args.steps is not None else (50 if args.fast else 150)
-    ok = run_shakedown(cfg, planned_tps=args.planned_tps, steps=steps, stage=args.stage,
-                       fast=args.fast)
+    rank, world, local_rank = (dist_util.setup_distributed() if args.multi_gpu else (0, 1, 0))
+    try:
+        ok = run_shakedown(cfg, planned_tps=args.planned_tps, steps=steps, stage=args.stage,
+                           fast=args.fast, rank=rank, world=world, local_rank=local_rank)
+    finally:
+        dist_util.cleanup_distributed()
     sys.exit(0 if ok else 1)
 
 

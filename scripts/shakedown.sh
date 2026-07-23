@@ -14,9 +14,30 @@
 # 50-step training measurement + single PPL eval cell. Full 150-step profile
 # (the default, no flag) is unchanged and remains what's required before any
 # multi-hour unattended run.
+#
+# Multi-GPU (WORLD > 1, single node): stages 1-2 below (env/pip/data) are
+# UNCHANGED -- they run once, single-process, regardless of WORLD. Stage 3
+# (model gates / training / eval) launches under `torchrun --standalone
+# --nproc_per_node=$WORLD -m hba.gates --multi-gpu`, which adds gate
+# gate_shard_partition (pure Python -- runs on every rank, trivially), plus
+# gate_rank_consistency and gate_nccl_bandwidth (both require the initialized
+# process group torchrun provides), and turns check_training's throughput
+# check into an aggregate-tok/s + scaling-efficiency gate (design doc gate 5).
+# Gate 1 (per-rank correctness) needs no special wiring: torchrun already runs
+# hba.gates.check_gates identically in every rank's own process. gate 4
+# (DDP-vs-single equivalence) is run as a SEPARATE step below, plain `python3`
+# (not torchrun) -- it orchestrates its OWN world=1 and world=WORLD subprocess
+# pair internally (gates.gate_ddp_equivalence) and must not be invoked
+# recursively from inside an already-running torchrun rank. Gate 6 (kill one
+# rank mid-run -> torchrun tears down -> relaunch --resume -> loss continues on
+# trajectory) is a MANUAL drill, documented (not automated) below -- it is
+# cheap to describe, not cheap to script unattended (it requires killing a
+# live training process partway through a real multi-hour run, not a
+# shakedown-scale smoke).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PLANNED_TPS="${PLANNED_TPS:-5000}"     # override to match the card; see docs/training-recipe.md
+WORLD="${WORLD:-1}"
 fail() { echo "SHAKEDOWN ABORT: $*" >&2; exit 1; }
 
 FAST=0
@@ -88,7 +109,46 @@ PY
 echo "======== STAGES 3-5: model gates / training / eval ========"
 FASTFLAG=""
 [ "$FAST" -eq 1 ] && FASTFLAG="--fast"
-python3 -m hba.gates --planned-tps "$PLANNED_TPS" --steps "$STEPS" $FASTFLAG
+if [ "$WORLD" -gt 1 ]; then
+  echo "-- multi-GPU mode: WORLD=$WORLD (torchrun --standalone --nproc_per_node=$WORLD) --"
+  torchrun --standalone --nproc_per_node="$WORLD" -m hba.gates \
+    --planned-tps "$PLANNED_TPS" --steps "$STEPS" $FASTFLAG --multi-gpu
+else
+  python3 -m hba.gates --planned-tps "$PLANNED_TPS" --steps "$STEPS" $FASTFLAG
+fi
 RC=$?
 if [ $RC -ne 0 ]; then echo "SHAKEDOWN FAILED (see results/shakedown_report.json)"; exit $RC; fi
+
+if [ "$WORLD" -gt 1 ]; then
+  echo "======== STAGE 6: DDP-vs-single-GPU equivalence gate (design doc gate 4) ========"
+  # Plain python3, NOT torchrun -- this gate orchestrates its OWN world=1 and
+  # world=WORLD subprocess pair internally (30 steps each, synthetic warmup=5
+  # compressed-cosine schedule -- see gates.gate_ddp_equivalence's docstring
+  # for why a real warmup=200 would pass this vacuously) and must not itself
+  # run inside an already-running torchrun rank.
+  python3 - "$WORLD" <<'PY' || fail "DDP-vs-single-GPU equivalence gate failed"
+import sys
+from hba.config import HBAConfig
+from hba.gates import gate_ddp_equivalence
+world = int(sys.argv[1])
+ok = gate_ddp_equivalence(HBAConfig(), world=world)
+sys.exit(0 if ok else 1)
+PY
+  echo ""
+  echo "======== GATE 6 (manual drill, not automated): kill+resume at WORLD=$WORLD ========"
+  echo "Not run by this script -- requires killing a LIVE multi-hour training process"
+  echo "partway through a real run, not a shakedown-scale smoke. To verify manually once a"
+  echo "real WORLD=$WORLD heal is underway (scripts/heal.sh with WORLD=$WORLD):"
+  echo "  1. Let it run past the first checkpoint write (~20 min, see heal.py's 1200s cadence)."
+  echo "  2. Kill ONE rank's process (e.g. \`kill\` the PID for local_rank=1) -- do NOT kill the"
+  echo "     whole torchrun process group; the point is verifying a single-rank failure tears"
+  echo "     the WHOLE run down (torchrun's default behavior) rather than hanging."
+  echo "  3. Confirm torchrun exits nonzero and every other rank's process also exits (NCCL"
+  echo "     detects the dropped peer -- if it hangs instead, that is a FAIL: report it)."
+  echo "  4. Relaunch: \`WORLD=$WORLD scripts/heal.sh --resume\`."
+  echo "  5. Confirm the loss log continues smoothly from the last checkpoint's step (no lm-loss"
+  echo "     discontinuity beyond ordinary step-to-step noise) -- a discontinuity here means the"
+  echo "     resumed stream/optimizer state diverged from what was actually checkpointed."
+fi
+
 echo "SHAKEDOWN PASS -- safe to launch the full run on this machine."

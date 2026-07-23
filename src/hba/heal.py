@@ -58,6 +58,7 @@ Usage (on a training box):
 """
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -74,23 +75,53 @@ from .config import (COMPUTE_DTYPE, DATA, DEVICE, INIT_PATH, RESULTS, HBAConfig,
 from .fam_data import FamMixer
 from .gates import gate_causality, gate_fused_agreement, gate_grad_isolation, gate_path_equivalence
 from .model import build_hba
+from . import dist_util
 from . import early_stop
 from . import probes as capability_probes
+
+# Global tokens/optimizer-step target the multi-GPU stream-sharding contract holds
+# CONSTANT across every (world, micro_batch, grad_accum) decomposition (dist_util's
+# module docstring): 32 windows * 4096 ctx at this repo's single-GPU defaults
+# (micro_batch=1, grad_accum=32 -- see main()'s non-smoke defaults below). Every
+# phase's per-length tokens/step (including stage3's mixed-length ctx_micro table)
+# is pre-registered to this same value; see dist_util.assert_valid_world_config for
+# the divisibility check a (world, micro_batch) pair must satisfy.
+GLOBAL_TOKENS_PER_STEP = 131072
+
+# Bumped whenever the realized data-stream enumeration (WindowStream/FamMixer g
+# indexing) or the FamMixer RNG-keying scheme changes for a FIXED (seed, cfg) --
+# i.e. whenever two runs at identical seed/cfg would now see different windows or
+# different rehearsal plants than before. 2 = the multi-GPU change: FamMixer keys
+# its RNG on the global window index g (dist_util.global_window_index) instead of
+# the single-process (m, b) pair (see fam_data.FamMixer._rng's docstring) --
+# required to make plants world-size-invariant, but it silently changes what a
+# pre-existing checkpoint would resume onto, hence the bump (see _sig below).
+STREAM_VERSION = 2
 
 # Per-stage token budgets and LRs (continued pretraining on a pretrained donor ->
 # small LRs, no from-scratch warmup blowups). Ratios match docs/training-
 # recipe.md's stage table (given there as tokens/param; instantiated here at
 # validation scale, 0.5B params). Note there is no unrehearsed full-parameter
 # stage in this budget table -- see the module docstring.
+# comm_dtype (multi-GPU DDP only; see dist_util.register_comm_hook): the
+# gradient-reduction dtype for that stage's all-reduce, pre-registered per stage
+# (not a runtime knob -- changing it is a recipe change, recorded in _sig).
+# Attention-only stage1 has small grads -> plain fp32 bucket all-reduce (DDP's
+# default, no comm hook needed). Full-parameter stage2/stage3 reduce the whole
+# model -> the bf16 gradient-compression hook halves communicated bytes, which
+# matters on hardware without GPU-to-GPU P2P (all-reduce stages through host
+# memory).
 PHASES = {
-    "stage1": dict(trainable={"attn", "summarizers"}, tokens=7.5e7, lr=2e-4, warmup=200),
+    "stage1": dict(trainable={"attn", "summarizers"}, tokens=7.5e7, lr=2e-4, warmup=200,
+                   comm_dtype="fp32"),
     # Full-parameter heal WITH capability rehearsal: a lower LR (vs a naive full-
     # param LR) plus a ~3% needle-familiarization data mix (fam_data.FamMixer) so
     # the induction/copy circuit is rehearsed during full-param healing instead of
     # trained away. The low LR is load-bearing on its own too (docs/training-
     # recipe.md: "4x higher destroyed retrieval capability at validation scale").
     "stage2": dict(trainable={"attn", "summarizers", "mlp", "norms", "embed"},
-                   tokens=2.5e8, lr=2.5e-5, warmup=200, fam_frac=0.03, probe_every=200),
+                   tokens=2.5e8, lr=2.5e-5, warmup=200, fam_frac=0.03, probe_every=200,
+                   comm_dtype="bf16"),
     # Length-curriculum heal (docs/design.md, "Softmax calibration"; docs/training-
     # recipe.md, "Length curriculum"). Continues from the FINISHED stage2
     # checkpoint at a deterministic per-step mixed-context cycle short:medium:long
@@ -116,7 +147,8 @@ PHASES = {
                    tokens=1.0e8, lr=2e-5, warmup=100, fam_frac=0.026, probe_every=200,
                    aux_off=True,
                    ctx_cycle=(4096, 16384, 8192, 16384),
-                   ctx_micro={4096: (2, 16), 8192: (1, 16), 16384: (1, 8)}),
+                   ctx_micro={4096: (2, 16), 8192: (1, 16), 16384: (1, 8)},
+                   comm_dtype="bf16"),
 }
 
 # stage -> the prior stage it seeds its weights from ("stage1" seeds from
@@ -148,10 +180,19 @@ class WindowStream:
             self._epoch = epoch
         return self._perm
 
-    def batch(self, m):
+    def batch(self, m, rank=0, world=1):
+        """`self.B` is the PER-RANK micro-batch. g is the world-size-invariant
+        global window index, computed by calling dist_util.global_window_index
+        directly (step=0 so its step term vanishes identically, leaving
+        exactly g = m*(world*B) + rank*B + b -- see that function's docstring
+        for the general formula) rather than re-deriving the same arithmetic a
+        second time here. At rank=0, world=1 (the single-GPU default) this is
+        exactly g = m*B + b -- bit-identical to the pre-multi-GPU formula, so
+        single-process behavior is unchanged."""
         ids = np.empty((self.B, self.l + 1), dtype=np.int64)
         for b in range(self.B):
-            g = m * self.B + b
+            g = dist_util.global_window_index(step=0, micro=m, b=b, rank=rank,
+                                              world=world, micro_B=self.B, accum=1)
             epoch, pos = divmod(g, self.W)
             w = int(self._perm_for(epoch)[pos])
             ids[b] = self.data[w * self.l: w * self.l + self.l + 1].astype(np.int64)
@@ -178,7 +219,7 @@ def make_opt(model, lr):
                               {"params": nodecay, "weight_decay": 0.0}], lr=lr, betas=(0.9, 0.95))
 
 
-def _sig(cfg, phase_tokens=None, ctx_schedule=None):
+def _sig(cfg, phase_tokens=None, ctx_schedule=None, comm_dtype=None):
     s = {k: getattr(cfg, k) for k in ("n_layers", "n_heads", "n_kv", "head_dim", "block",
                                       "window", "sinks", "k_blocks", "slots", "heal_ctx")}
     # The RESOLVED attention backend is part of the run identity (fused and naive
@@ -195,6 +236,29 @@ def _sig(cfg, phase_tokens=None, ctx_schedule=None):
     # as another's).
     if ctx_schedule is not None:
         s["ctx_schedule"] = ctx_schedule
+    # --- multi-GPU identity fields (design: "checkpoint identity") -----------
+    # stream_version: bumped whenever the realized data-stream enumeration or the
+    # FamMixer RNG-keying scheme changes for a fixed (seed, cfg) -- see this
+    # module's STREAM_VERSION docstring above. A pre-bump checkpoint resuming on
+    # the post-bump stream would silently continue training on DIFFERENT data
+    # than the run it thinks it's continuing; refusing that resume (via a _sig
+    # mismatch) is the whole point of this field.
+    s["stream_version"] = STREAM_VERSION
+    # global_tokens_per_step: binds the world-size-invariance CONTRACT itself (see
+    # dist_util's module docstring) -- a run at a different global tokens/step is
+    # a different recipe, not a portable resharding of the same one, and must not
+    # resume across that boundary either.
+    s["global_tokens_per_step"] = GLOBAL_TOKENS_PER_STEP
+    # comm_dtype: the DDP gradient-reduction dtype (dist_util.register_comm_hook)
+    # is part of the training recipe (fp32 vs bf16-compressed all-reduce changes
+    # the realized gradient, if only at fp noise level) -- pre-registered per
+    # phase (PHASES[phase]["comm_dtype"]), not a free runtime knob, so it belongs
+    # in the identity like attn_backend above. Deliberately world-size-agnostic:
+    # world size and per-rank micro_batch/grad_accum are NOT part of _sig (that
+    # omission IS the portability -- a checkpoint must resume unchanged whether
+    # relaunched at world=1, 4, or 8, as long as global_tokens_per_step matches).
+    if comm_dtype is not None:
+        s["comm_dtype"] = comm_dtype
     return s
 
 
@@ -233,7 +297,8 @@ def _data_guards(phase, tokens, smoke, allow_small, shakedown=False):
 
 
 def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_small=False,
-          shakedown=False, probe_every=None, warmup_steps=0):
+          shakedown=False, probe_every=None, warmup_steps=0, rank=0, world=1, local_rank=0,
+          tps_out=None):
     """Returns 'complete' | 'done' | 'guard' (wall-clock guard hit; NOT finished).
 
     warmup_steps: INTERNAL (threaded from gates.check_training's --fast profile
@@ -244,7 +309,38 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
     diluted away the way it is at a real phase's step count -- once
     `warmup_steps` steps have completed, the tok/s baseline resets so the
     reported throughput reflects steady state only (see the tps computation
-    below)."""
+    below).
+
+    tps_out: OPTIONAL mutable dict (a rank-agnostic recording channel -- e.g.
+    `{}` passed in by the caller and read back after this returns). If given,
+    THIS rank's own measured tok/s series is appended to tps_out["series"] at
+    the same cadence as the status log line below, REGARDLESS of `rank` (the
+    log line itself stays rank-0-only to avoid spam -- see the Logging note
+    below). This is how gates.check_training measures per-rank throughput
+    directly at world > 1: every rank calls train() in-process and reads its
+    OWN tps_out, instead of monkeypatching heal.log and parsing the rank-0-only
+    status line, which structurally never fires on ranks != 0 (design fix for
+    the multi-GPU throughput gate -- see check_training's docstring).
+
+    rank/world/local_rank: multi-GPU DDP coordinates (dist_util.setup_distributed's
+    return values; defaults 0/1/0 reproduce single-GPU behavior exactly -- every
+    distributed call in this function is behind an `is_distributed()` guard, so a
+    plain `python -m hba.heal` invocation never touches torch.distributed at all).
+    `micro_batch` and `grad_accum` are PER-RANK (see dist_util's module docstring
+    for the world-size-invariant g = step*(world*micro_B*accum) + micro*(world*
+    micro_B) + rank*micro_B + b sharding formula); global tokens/step = world *
+    micro_batch * grad_accum * ctx, held constant at GLOBAL_TOKENS_PER_STEP across
+    every (world, micro_batch, grad_accum) decomposition main() validates before
+    calling in.
+
+    Logging: high-frequency per-step/per-firing log lines (tok/s status, panel
+    firings, checkpoint/milestone/guard notices) are rank-0-only below, to avoid
+    `world`-way duplicate spam under torchrun -- one-time setup lines above stay
+    unrestricted (small volume; seeing them from every rank is a useful sanity
+    check that all ranks agree on the schedule)."""
+    def rlog(*a):
+        if rank == 0:
+            log(*a)
     # ES-2 tombstone: a prior run's forgetting-abort halted, rolled back, and
     # left this marker (early_stop.write_tombstone). The data stream is
     # deterministic, so restarting unattended would just replay the identical
@@ -259,30 +355,68 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
             "retrieval failures in minutes), then delete the tombstone deliberately once addressed.")
         sys.exit(1)
     p = PHASES[phase]
+    comm_dtype = p.get("comm_dtype", "fp32")
     mixed = "ctx_cycle" in p
     ckpt_path = os.path.join(RESULTS, f"heal_{phase}{'_smoke' if smoke else ''}.pt")
     if mixed:
         cycle = tuple(p["ctx_cycle"])
         ctx_micro = dict(p["ctx_micro"])
-        tps_set = {c * mb * ga for c, (mb, ga) in ctx_micro.items()}
+        # World-size reshard (dist_util's module docstring): the PHASES table's
+        # per-length (micro_B, accum) is a world=1 recipe. At world>1, holding
+        # GLOBAL tokens/step (== windows_per_step_1gpu = micro_B*accum at world=1)
+        # constant means shrinking accum by a factor of `world` while micro_B (a
+        # GPU-memory-bound per-rank quantity) stays as configured; the divisibility
+        # assert below is the launcher-level guard from the design (section 1) that
+        # a bad (world, micro_B) combination fails loudly instead of silently
+        # drifting global tokens/step.
+        if world > 1:
+            resharded = {}
+            for c, (mb, ga) in ctx_micro.items():
+                try:
+                    resharded[c] = (mb, dist_util.assert_valid_world_config(mb * ga, mb, world))
+                except AssertionError as e:
+                    # dist_util.assert_valid_world_config's own message identifies
+                    # the (windows_per_step_target, micro_B, world) mismatch but
+                    # not WHICH curriculum length it was resharding for -- add
+                    # that here so a stage-3 launch failure names the exact ctx.
+                    raise AssertionError(
+                        f"[{phase}] stage-3 world-size reshard failed for ctx={c} "
+                        f"(micro_B={mb}, accum={ga}, world={world}): {e}"
+                    ) from e
+            ctx_micro = resharded
+        tps_set = {c * mb * ga * world for c, (mb, ga) in ctx_micro.items()}
         assert len(tps_set) == 1, f"tokens/step not invariant across lengths: {ctx_micro}"
         tokens_per_step = tps_set.pop()
         ctx = max(ctx_micro)                      # longest ctx (rope tables per-length below)
         sig_sched = f"cycle={cycle} micro={sorted(ctx_micro.items())}"
         log(f"[{phase}] MIXED-LENGTH schedule: per-step ctx cycle {cycle} "
             f"(4K:8K:16K = {cycle.count(4096)}:{cycle.count(8192)}:{cycle.count(16384)} per "
-            f"cycle), per-ctx (micro,accum)={ctx_micro} -> tokens/step={tokens_per_step} "
-            "invariant at every length")
+            f"cycle), per-rank-ctx (micro,accum)={ctx_micro} world={world} -> "
+            f"global tokens/step={tokens_per_step} invariant at every length")
         log(f"[{phase}] NOTE: CLI --micro-batch/--grad-accum are IGNORED for mixed-length "
             "phases (the schedule fixes them per length)")
     else:
         cycle = ctx_micro = None
         sig_sched = None
         ctx = cfg.heal_ctx
-        tokens_per_step = micro_batch * grad_accum * ctx
+        tokens_per_step = micro_batch * grad_accum * ctx * world
+        # Belt-and-suspenders: main() already picks/validates grad_accum against
+        # GLOBAL_TOKENS_PER_STEP for a real (non-smoke, non-shakedown) run, but
+        # train() re-checks here too (repo convention: refuse rather than silently
+        # drift -- see _data_guards/ES-2 tombstone's identical "belt only, not the
+        # only place it's enforced" pattern above).
+        if not smoke and not shakedown:
+            assert tokens_per_step == GLOBAL_TOKENS_PER_STEP, (
+                f"[{phase}] tokens/step={tokens_per_step} (micro_batch={micro_batch} x "
+                f"grad_accum={grad_accum} x ctx={ctx} x world={world}) != "
+                f"GLOBAL_TOKENS_PER_STEP={GLOBAL_TOKENS_PER_STEP} -- the multi-GPU sharding "
+                "contract requires holding global tokens/step constant across world sizes; "
+                "see dist_util.assert_valid_world_config"
+            )
     total_steps = math.ceil(p["tokens"] / tokens_per_step)
     log(f"[{phase}] budget {p['tokens']/1e6:.0f}M tok  tps={tokens_per_step} -> {total_steps} steps  "
-        f"lr={p['lr']} guard={budget_s/3600:.1f}h ctx={ctx}")
+        f"lr={p['lr']} guard={budget_s/3600:.1f}h ctx={ctx} world={world} rank={rank} "
+        f"comm_dtype={comm_dtype}")
     if p.get("aux_off"):
         cfg.aux_w = 0.0
         log(f"[{phase}] *** AUX-KL TEACHER OFF (aux_w=0.0): the O(n^2) teacher is skipped "
@@ -331,8 +465,14 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
 
     step0 = 0
     if resume and os.path.exists(ckpt_path):
+        # ALL ranks independently torch.load + load_state_dict here (not just
+        # rank 0 + DDP's constructor-time broadcast): the design's point is a
+        # DIRECT check that every rank's own read of the checkpoint landed on
+        # identical parameters, which a broadcast-from-rank-0 would silently
+        # paper over (it would just overwrite a bad rank's params with rank 0's,
+        # masking exactly the torn-read failure mode this guards against).
         ck = torch.load(ckpt_path, map_location=DEVICE)
-        if ck.get("cfg_sig") == _sig(cfg, p["tokens"], sig_sched):
+        if ck.get("cfg_sig") == _sig(cfg, p["tokens"], sig_sched, comm_dtype):
             model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); step0 = ck["step"]
             if ck.get("done"):
                 log(f"[{phase}] already complete at step {step0}"); return "complete"
@@ -343,9 +483,29 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
             # would train from RANDOM summarizers (stage1) or the raw donor
             # (stage2/3) with the seeded init silently dropped.
             log(f"[{phase}] ABORT: {ckpt_path} exists but its cfg_sig mismatches this run "
-                "(cfg/backend/token-budget changed). Move the stale checkpoint aside "
+                "(cfg/backend/token-budget changed -- OR, for an otherwise-unchanged older "
+                f"checkpoint, STREAM_VERSION was bumped since it was written: currently "
+                f"{STREAM_VERSION}, see this module's STREAM_VERSION docstring for what that "
+                "bump means and why it isn't resumable). Move the stale checkpoint aside "
                 "explicitly, or rerun without --resume after verifying which run it belongs to.")
             sys.exit(1)
+        # Blocking rank-consistency check (design: "a rank-consistency check
+        # verifies identical parameters before any step -- guards a torn read"):
+        # every rank's own independent load above must have landed on the exact
+        # same parameters. No-op at world=1.
+        dist_util.assert_rank_consistent(model, DEVICE, tag=f"[{phase}] post-resume-load")
+
+    # DDP construction happens AFTER set_trainable (the trainable set changes per
+    # stage -- DDP's bucket/hook registration must see the final requires_grad
+    # state) and after the resume-load block above (so DDP's own constructor-time
+    # broadcast, if it ran, would be redundant with -- not a substitute for -- the
+    # independent-load-then-verify sequence just above). No-op at world=1: `model`
+    # stays the plain HBAModel, and `raw is model`, so every attribute access below
+    # (model.lm_head, model._last_aux, model.state_dict(), ...) is unchanged from
+    # the pre-multi-GPU code path.
+    if dist_util.is_distributed():
+        model = dist_util.wrap_ddp(model, local_rank, comm_dtype)
+    raw = dist_util.raw_model(model)
 
     base_seed = cfg.seed if hasattr(cfg, "seed") else 0
     stream = fam = None
@@ -394,9 +554,22 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
     warm_t0 = warm_tok0 = None
 
     def save(step, done):
-        save_ckpt_atomic({"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
-                          "done": done, "cfg_sig": _sig(cfg, p["tokens"], sig_sched),
-                          "phase": phase, "tok_seen": tok_seen}, ckpt_path)
+        # Collective: rank 0 writes (the atomic tmp+rename pattern, unchanged from
+        # single-GPU), bracketed by barriers so no rank proceeds into the next
+        # step's collective forward/backward while rank 0 is still mid-write, and
+        # no rank races ahead reading a file rank 0 hasn't finished renaming into
+        # place yet. `raw.state_dict()` -- the UNWRAPPED model -- so single-GPU
+        # tools (evals.py, gates.py's reference check) load the checkpoint
+        # unchanged regardless of what world size produced it. Optimizer state is
+        # replicated identically across ranks by construction (every rank runs the
+        # same AdamW update on the same post-all-reduce gradient), so rank 0's opt
+        # state IS the whole truth -- no need to gather it from other ranks.
+        dist_util.barrier()
+        if rank == 0:
+            save_ckpt_atomic({"model": raw.state_dict(), "opt": opt.state_dict(), "step": step,
+                              "done": done, "cfg_sig": _sig(cfg, p["tokens"], sig_sched, comm_dtype),
+                              "phase": phase, "tok_seen": tok_seen}, ckpt_path)
+        dist_util.barrier()
 
     # in-training capability PANEL (probes.run_panel; docs/training-recipe.md,
     # "Monitoring") + the pre-registered early-stopping rules that consume its
@@ -458,39 +631,58 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
                 step * grad_accum
         t_step = time.time()
         for micro in range(ga_s):
-            ids = stream_s.batch(m0 + micro).to(DEVICE)
+            # world-size-invariant sharding: each rank pulls its OWN micro_B-sized
+            # slice of this micro-step's global window range (dist_util's module
+            # docstring / WindowStream.batch's docstring) -- a partition, not a
+            # duplication, of the data every optimizer step consumes.
+            ids = stream_s.batch(m0 + micro, rank=rank, world=world).to(DEVICE)
             inp, tgt = ids[:, :-1], ids[:, 1:]
             ctx_ = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if autocast \
                 else torch.autocast(device_type="cpu", enabled=False)
-            with ctx_:
-                if mixed:
-                    # chunked-CE forward: the [B,n,V] logit tensor is never
-                    # materialized (a mixed-length OOM hazard at longer context).
-                    # Exact same mean CE.
-                    loss_lm = model(inp, cos_s, sin_s, cap, mode="train", loss_tgt=tgt)
-                    aux = model._last_aux
-                    aux = aux if aux is not None else loss_lm.new_zeros(())
-                else:
-                    # chunked CE here too: recompute-in-backward keeps the peak
-                    # at one chunk's fp32 logits instead of the full [B*n, V]
-                    # tensor (the micro-batch ceiling; see chunked_ce.py).
-                    hidden = model(inp, cos_s, sin_s, cap, mode="train",
-                                   return_hidden=True)
-                    aux = model._last_aux
-                    aux = aux if aux is not None else hidden.new_zeros(())
-                    loss_lm = chunked_cross_entropy(hidden, model.lm_head.weight,
-                                                    tgt, bias=model.lm_head.bias,
-                                                    chunk_size=1024)
-                loss = loss_lm + cfg.aux_w * aux
-            (loss / ga_s).backward()
+            # DDP gradient sync: reduce ONCE per optimizer step, not once per
+            # micro-step. no_sync() on every micro-step except the last accumulates
+            # grads locally (each rank's .backward() below still runs, just without
+            # triggering DDP's all-reduce hooks); the final micro-step's backward
+            # runs OUTSIDE no_sync so its all-reduce also captures every earlier
+            # micro-step's already-accumulated local gradient in the same bucket
+            # flush. No-op context at world=1 (nullcontext).
+            last_micro = (micro == ga_s - 1)
+            sync_ctx = (model.no_sync() if (dist_util.is_distributed() and not last_micro)
+                       else contextlib.nullcontext())
+            with sync_ctx:
+                with ctx_:
+                    if mixed:
+                        # chunked-CE forward: the [B,n,V] logit tensor is never
+                        # materialized (a mixed-length OOM hazard at longer context).
+                        # Exact same mean CE.
+                        loss_lm = model(inp, cos_s, sin_s, cap, mode="train", loss_tgt=tgt)
+                        aux = raw._last_aux
+                        aux = aux if aux is not None else loss_lm.new_zeros(())
+                    else:
+                        # chunked CE here too: recompute-in-backward keeps the peak
+                        # at one chunk's fp32 logits instead of the full [B*n, V]
+                        # tensor (the micro-batch ceiling; see chunked_ce.py).
+                        hidden = model(inp, cos_s, sin_s, cap, mode="train",
+                                       return_hidden=True)
+                        aux = raw._last_aux
+                        aux = aux if aux is not None else hidden.new_zeros(())
+                        loss_lm = chunked_cross_entropy(hidden, raw.lm_head.weight,
+                                                        tgt, bias=raw.lm_head.bias,
+                                                        chunk_size=1024)
+                    loss = loss_lm + cfg.aux_w * aux
+                (loss / ga_s).backward()
             loss_v += float(loss_lm.detach()) / ga_s
             aux_v += float(aux.detach()) / ga_s
             tok_seen += inp.numel()
+        # Grad clip AFTER the final synced backward (the summarizer aux-loss
+        # gradient-isolation property -- gates.gate_grad_isolation -- is per-rank
+        # and untouched by DDP's all-reduce, which only sums the LM-path grads the
+        # isolation rule already routes to q/k/v/o/mlp/embed).
         torch.nn.utils.clip_grad_norm_([pp for pp in model.parameters() if pp.requires_grad], 1.0)
         opt.step()
         if warmup_steps and warm_t0 is None and (step - step0 + 1) >= warmup_steps:
             warm_t0, warm_tok0 = time.time(), tok_seen
-            log(f"[{phase}] warmup ({warmup_steps} steps) excluded from tok/s window -- "
+            rlog(f"[{phase}] warmup ({warmup_steps} steps) excluded from tok/s window -- "
                 "resetting throughput baseline")
         if mixed:
             st = per_ctx[c_s]
@@ -505,76 +697,147 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
         # kept ALONGSIDE the best-panel checkpoint (below) so cross-run
         # comparisons always have a common-token-count checkpoint to compare at,
         # even if a run stops early on ES-1/ES-2: early stopping must never make
-        # two runs incomparable.
+        # two runs incomparable. tok_seen advances IDENTICALLY on every rank (same
+        # per-rank micro_batch/grad_accum/ctx everywhere), so every rank crosses a
+        # milestone at the identical step with no broadcast needed -- only the
+        # FILE WRITE itself needs to be collective (rank 0 + barriers).
         if milestones_hit is not None:
             for pct in (25, 50, 75):
                 if pct not in milestones_hit and tok_seen >= pct / 100 * p["tokens"]:
                     milestones_hit.add(pct)
                     mpath = os.path.join(RESULTS, f"heal_{phase}{sfx}_milestone{pct}.pt")
-                    save_ckpt_atomic({"model": model.state_dict(), "opt": opt.state_dict(),
-                                      "step": step + 1, "done": False,
-                                      "cfg_sig": _sig(cfg, p["tokens"], sig_sched),
-                                      "phase": phase, "tok_seen": tok_seen,
-                                      "milestone_pct": pct}, mpath)
-                    log(f"[{phase}] milestone checkpoint {pct}% ({tok_seen/1e6:.0f}M tok) -> {mpath}")
+                    dist_util.barrier()
+                    if rank == 0:
+                        save_ckpt_atomic({"model": raw.state_dict(), "opt": opt.state_dict(),
+                                          "step": step + 1, "done": False,
+                                          "cfg_sig": _sig(cfg, p["tokens"], sig_sched, comm_dtype),
+                                          "phase": phase, "tok_seen": tok_seen,
+                                          "milestone_pct": pct}, mpath)
+                        log(f"[{phase}] milestone checkpoint {pct}% ({tok_seen/1e6:.0f}M tok) -> {mpath}")
+                    dist_util.barrier()
 
         # mixed: log one FULL cycle every 20 steps (20 % len(cycle) == 0, so a bare
         # %20 gate would only ever show cycle position 0; the bracket accumulators
         # cover all lengths either way, but per-length loss visibility needs the
-        # whole cycle logged).
+        # whole cycle logged). The tps MEASUREMENT below runs on EVERY rank
+        # (needed for tps_out -- gates.check_training's per-rank throughput
+        # channel, see train()'s docstring); only the actual log() call is
+        # rank-0-only, to avoid world-way duplicate spam under torchrun (every
+        # rank's loss/tok-s numbers are near-identical by construction anyway).
         if (step % 20 < len(cycle)) if mixed else (step % 20 == 0):
             el = time.time() - t_start
             if warm_t0 is not None:
                 tps = (tok_seen - warm_tok0) / max(1e-6, time.time() - warm_t0)
             else:
                 tps = (tok_seen - step0 * tokens_per_step) / max(1e-6, el)
-            fam_s = f" fam {fam.ratio()*100:.2f}%" if fam is not None else ""
-            if mixed:
-                parts = []
-                for c in sorted(per_ctx):
-                    st = per_ctx[c]
-                    if st["steps"]:
-                        fr = f",fam{fams[c].ratio()*100:.2f}%" if fams[c] is not None else ""
-                        parts.append(f"{c//1024}K:{st['tok']/max(1e-6, st['sec']):.0f}t/s,"
-                                     f"{st['peak']:.1f}G{fr}")
-                fam_s = "  [" + " ".join(parts) + "]"
-            ctx_s_ = f" ctx {c_s}" if mixed else ""
-            log(f"[{phase}] step {step:6d}/{total_steps}{ctx_s_} lm {loss_v:.4f} ppl "
-                f"{math.exp(min(20, loss_v)):.2f} aux {aux_v:.4f} tok/s {tps:6.0f} lr {lr:.2e} "
-                f"tok {tok_seen/1e6:.0f}M elapsed {el/3600:.2f}h{fam_s}")
-        if pe and step % pe == 0:
-            t_p = time.time()
-            # Fixed seed reissued fresh every firing (see probes.PANEL_SEED's
-            # docstring): the panel must present IDENTICAL synthetic items every
-            # time it fires so accuracy deltas reflect the model, not resampling.
-            rng = np.random.default_rng(capability_probes.PANEL_SEED)
-            panel_out = capability_probes.run_panel(model, tok, cfg, rng)
-            meta = capability_probes.PANEL_BY_NAME
-            accs = {k: v for k, v in panel_out.items() if meta[k].kind == "acc"}
-            n_trials = {k: meta[k].trials for k in accs}
-            val_loss = panel_out.get("val_loss_fixed", float("nan"))
-            firing = dict(step=step, tokens=tok_seen, accs=accs, n_trials=n_trials,
-                         val_loss=val_loss, wall_s=round(time.time() - t_p, 2))
-            early_stop.append_probe_log(probe_log_path, firing)
-            probe_history.append(firing)
-            msg = " ".join(f"{k}={v:.3f}" for k, v in accs.items())
-            log(f"[{phase}] PANEL @ step {step}: {msg} val_loss={val_loss:.4f} "
-                f"({firing['wall_s']:.0f}s) tok={tok_seen/1e6:.0f}M")
+            if tps_out is not None:
+                tps_out.setdefault("series", []).append(tps)
+            if rank == 0:
+                fam_s = f" fam {fam.ratio()*100:.2f}%" if fam is not None else ""
+                if mixed:
+                    parts = []
+                    for c in sorted(per_ctx):
+                        st = per_ctx[c]
+                        if st["steps"]:
+                            fr = f",fam{fams[c].ratio()*100:.2f}%" if fams[c] is not None else ""
+                            parts.append(f"{c//1024}K:{st['tok']/max(1e-6, st['sec']):.0f}t/s,"
+                                         f"{st['peak']:.1f}G{fr}")
+                    fam_s = "  [" + " ".join(parts) + "]"
+                ctx_s_ = f" ctx {c_s}" if mixed else ""
+                wtag = f" world={world}" if world > 1 else ""
+                log(f"[{phase}] step {step:6d}/{total_steps}{ctx_s_} lm {loss_v:.4f} ppl "
+                    f"{math.exp(min(20, loss_v)):.2f} aux {aux_v:.4f} tok/s {tps:6.0f}{wtag} lr {lr:.2e} "
+                    f"tok {tok_seen/1e6:.0f}M elapsed {el/3600:.2f}h{fam_s}")
 
-            pm = early_stop.panel_mean(firing)
-            if pm is not None and pm > best_panel_mean:
-                best_panel_mean = pm
-                save_ckpt_atomic({"model": model.state_dict(), "opt": opt.state_dict(),
-                                  "step": step + 1, "done": False,
-                                  "cfg_sig": _sig(cfg, p["tokens"], sig_sched), "phase": phase,
-                                  "tok_seen": tok_seen, "panel_mean": pm}, best_ckpt_path)
-                log(f"[{phase}] new best-panel checkpoint (mean={pm:.3f}) -> {best_ckpt_path}")
+        # ---- collective control flow (design: "ALL control flow is step-based or
+        # rank-0-broadcast -- NEVER rank-local wall-clock") ----------------------
+        # Rank-local time.time() reads drift: if every rank independently decided
+        # "time to checkpoint" or "wall-clock guard hit" or consumed its OWN copy
+        # of the early-stop verdict, ranks could take DIFFERENT branches at the
+        # same step (e.g. rank 0 enters a collective save() while another rank
+        # enters the next step's collective forward/backward) -- an NCCL deadlock,
+        # not a crash. So: rank 0 ALONE evaluates the panel/early-stop engine (a
+        # GPU-cost concern, not just a correctness one -- running the panel on
+        # every rank would be redundant compute) and the two wall-clock checks,
+        # packs the result into a 3-int control tensor, and broadcasts it; every
+        # rank then branches on the IDENTICAL received values. No-op broadcast at
+        # world=1 (dist_util.broadcast_ctrl returns the local tensor unchanged),
+        # so this reduces to exactly the original single-process control flow.
+        rank0_do = dict(save_ckpt=False, guard=False, es_action=0, es_verdict=None)
+        if rank == 0:
+            if pe and step % pe == 0:
+                t_p = time.time()
+                # Fixed seed reissued fresh every firing (see probes.PANEL_SEED's
+                # docstring): the panel must present IDENTICAL synthetic items
+                # every time it fires so accuracy deltas reflect the model, not
+                # resampling. Runs on rank 0's `raw` (unwrapped) model only --
+                # see module docstring: redundant on every rank, and DDP doesn't
+                # proxy the attribute access (model.lm_head etc.) probes.py needs.
+                rng = np.random.default_rng(capability_probes.PANEL_SEED)
+                panel_out = capability_probes.run_panel(raw, tok, cfg, rng)
+                meta = capability_probes.PANEL_BY_NAME
+                accs = {k: v for k, v in panel_out.items() if meta[k].kind == "acc"}
+                n_trials = {k: meta[k].trials for k in accs}
+                val_loss = panel_out.get("val_loss_fixed", float("nan"))
+                firing = dict(step=step, tokens=tok_seen, accs=accs, n_trials=n_trials,
+                             val_loss=val_loss, wall_s=round(time.time() - t_p, 2))
+                early_stop.append_probe_log(probe_log_path, firing)
+                probe_history.append(firing)
+                msg = " ".join(f"{k}={v:.3f}" for k, v in accs.items())
+                log(f"[{phase}] PANEL @ step {step}: {msg} val_loss={val_loss:.4f} "
+                    f"({firing['wall_s']:.0f}s) tok={tok_seen/1e6:.0f}M")
 
-            verdict = engine.evaluate(probe_history)
-            if verdict.rule_fired == "ES-2":
-                log(f"[{phase}] *** ES-2 FORGETTING ABORT: {verdict.details} ***")
-                rolled_back_to = None
-                if os.path.exists(best_ckpt_path):
+                pm = early_stop.panel_mean(firing)
+                if pm is not None and pm > best_panel_mean:
+                    best_panel_mean = pm
+                    save_ckpt_atomic({"model": raw.state_dict(), "opt": opt.state_dict(),
+                                      "step": step + 1, "done": False,
+                                      "cfg_sig": _sig(cfg, p["tokens"], sig_sched, comm_dtype),
+                                      "phase": phase,
+                                      "tok_seen": tok_seen, "panel_mean": pm}, best_ckpt_path)
+                    log(f"[{phase}] new best-panel checkpoint (mean={pm:.3f}) -> {best_ckpt_path}")
+
+                verdict = engine.evaluate(probe_history)
+                if verdict.rule_fired == "ES-2":
+                    log(f"[{phase}] *** ES-2 FORGETTING ABORT: {verdict.details} ***")
+                    rank0_do["es_action"] = dist_util.ES_ACTION_ES2
+                    rank0_do["es_verdict"] = verdict
+                elif verdict.rule_fired == "ES-1":
+                    log(f"[{phase}] *** ES-1 PLATEAU STOP: {verdict.details} ***")
+                    rank0_do["es_action"] = dist_util.ES_ACTION_ES1
+                    rank0_do["es_verdict"] = verdict
+            if rank0_do["es_action"] == 0:
+                # Only evaluated when ES didn't already decide to act this step --
+                # matches the original code's control flow exactly (there, these
+                # checks sit OUTSIDE the `if pe...` block and are simply never
+                # reached once that block has returned).
+                if time.time() - t_ckpt > 1200:
+                    rank0_do["save_ckpt"] = True
+                if time.time() - t_start > budget_s:
+                    rank0_do["guard"] = True
+
+        ctrl = dist_util.broadcast_ctrl(
+            dist_util.make_ctrl(rank0_do["save_ckpt"], rank0_do["guard"], rank0_do["es_action"]), rank)
+        do_save, do_guard, es_action = (int(x) for x in ctrl.tolist())
+
+        if es_action == dist_util.ES_ACTION_ES2:  # collective forgetting-abort rollback
+            # "rank-0 decides -> broadcast -> all ranks load the rollback
+            # checkpoint -> barrier -> resume" (design section 4). Every rank
+            # (not just rank 0) loads best_ckpt_path into its OWN model/opt here,
+            # even though this process is about to exit right after -- this is
+            # what makes the in-memory state consistent with what gets promoted
+            # to ckpt_path below, and is the collective op a future code path
+            # that continues past ES-2 (rather than halting) would rely on.
+            rolled_back_to = None
+            best = None
+            if os.path.exists(best_ckpt_path):
+                best = torch.load(best_ckpt_path, map_location=DEVICE)
+                raw.load_state_dict(best["model"]); opt.load_state_dict(best["opt"])
+                rolled_back_to = best["step"]
+            dist_util.barrier()
+            if rank == 0:
+                verdict = rank0_do["es_verdict"]
+                if best is not None:
                     # Promote the best-panel checkpoint's EXACT saved (model, opt,
                     # step) triple to be the phase checkpoint -- not a fresh save
                     # of the current (collapsed) step with rolled-back weights
@@ -586,8 +849,6 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
                     # the collapse is exactly the one who should decide that's
                     # what they want (docs/training-recipe.md: "halt, roll back
                     # ... diagnose before continuing").
-                    best = torch.load(best_ckpt_path, map_location=DEVICE)
-                    rolled_back_to = best["step"]
                     save_ckpt_atomic(best, ckpt_path)
                     log(f"[{phase}] rolled back to best-panel checkpoint @ step {rolled_back_to} "
                         f"(panel_mean={best.get('panel_mean')})")
@@ -601,24 +862,26 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
                 log(f"[{phase}] tombstone written -> {early_stop.tombstone_path(RESULTS)}; "
                     "heal.py will refuse to start/resume ANY phase until it is diagnosed and "
                     "deleted deliberately")
-                return "es2_halt"
-            if verdict.rule_fired == "ES-1":
-                log(f"[{phase}] *** ES-1 PLATEAU STOP: {verdict.details} ***")
-                save(step + 1, True)
+            dist_util.barrier()
+            return "es2_halt"
+        if es_action == dist_util.ES_ACTION_ES1:  # clean plateau stop
+            save(step + 1, True)
+            if rank == 0:
+                verdict = rank0_do["es_verdict"]
                 _write_json_atomic(
                     dict(budget=p["tokens"], stopped_at_tokens=tok_seen, rule_fired="ES-1",
                         details=verdict.details),
                     os.path.join(RESULTS, f"{phase}{sfx}_early_stop.json"))
                 log(f"[{phase}] clean stop @ step {step} ({tok_seen/1e6:.0f}M / "
                     f"{p['tokens']/1e6:.0f}M tok)")
-                return "early_stop"
-        if time.time() - t_ckpt > 1200:
-            save(step + 1, False); t_ckpt = time.time(); log(f"[{phase}] checkpoint @ {step+1}")
-        if time.time() - t_start > budget_s:
-            log(f"[{phase}] *** WALL-CLOCK GUARD {budget_s/3600:.1f}h HIT @ {step}; saving ***")
+            return "early_stop"
+        if do_save:
+            save(step + 1, False); t_ckpt = time.time(); rlog(f"[{phase}] checkpoint @ {step+1}")
+        if do_guard:
+            rlog(f"[{phase}] *** WALL-CLOCK GUARD {budget_s/3600:.1f}h HIT @ {step}; saving ***")
             save(step + 1, False); return "guard"
     save(total_steps, True)
-    log(f"[{phase}] COMPLETE @ {total_steps} ({tok_seen/1e6:.0f}M tok)")
+    rlog(f"[{phase}] COMPLETE @ {total_steps} ({tok_seen/1e6:.0f}M tok)")
     return "done"
 
 
@@ -635,6 +898,12 @@ def main():
     ap.add_argument("--grad-accum", type=int, default=None)
     ap.add_argument("--budget-s", type=float, default=None)
     ap.add_argument("--tokens", type=float, default=None, help="override phase token budget")
+    ap.add_argument("--warmup", type=int, default=None,
+                    help="override phase LR-warmup steps (INTERNAL: used by gates."
+                         "gate_ddp_equivalence to compress the DDP-vs-single-GPU equivalence "
+                         "gate's 30-step comparison into a synthetic short schedule -- a real "
+                         "warmup=200 would apply near-zero LR across all 30 steps and pass the "
+                         "gate vacuously even with broken sharding).")
     ap.add_argument("--skip-gates", action="store_true")
     ap.add_argument("--allow-small-corpus", action="store_true",
                     help="override the corpus-vs-budget size guard (multi-epoch healing)")
@@ -647,6 +916,20 @@ def main():
                          "naive = the materialized-scores correctness oracle (markedly slower).")
     args = ap.parse_args()
 
+    # Multi-GPU setup FIRST, before any CUDA allocation: torch.cuda.set_device
+    # (inside setup_distributed) must run before build_hba's donor .to(device)
+    # call, else every rank would allocate on GPU 0. No-op (rank=0, world=1,
+    # local_rank=0) when not launched under torchrun -- every distributed call
+    # anywhere below this point is behind an is_distributed() guard, so a plain
+    # `python -m hba.heal` invocation is completely unaffected.
+    rank, world, local_rank = dist_util.setup_distributed()
+    try:
+        _heal_main(args, rank, world, local_rank)
+    finally:
+        dist_util.cleanup_distributed()
+
+
+def _heal_main(args, rank, world, local_rank):
     cfg = smoke_config() if args.smoke else HBAConfig()
     if args.attn_backend is not None:
         cfg.attn_backend = args.attn_backend
@@ -654,15 +937,52 @@ def main():
         cfg.seed = 0
     if args.tokens is not None:
         PHASES[args.phase]["tokens"] = args.tokens
-    # CUDA default micro_batch=1, grad_accum=32 (tokens/step 131072): backward-pass
-    # activation memory at micro_batch=2 and heal_ctx=4096 can exceed a 24GB-class
-    # card even with grad checkpointing + bf16 autocast; raise --micro-batch on
-    # cards with more headroom.
+    if args.warmup is not None:
+        PHASES[args.phase]["warmup"] = args.warmup
+    # CUDA default micro_batch=1 (PER RANK), grad_accum computed to hold GLOBAL
+    # tokens/step == GLOBAL_TOKENS_PER_STEP constant across world size (dist_util's
+    # module docstring): backward-pass activation memory at micro_batch=2 and
+    # heal_ctx=4096 can exceed a 24GB-class card even with grad checkpointing +
+    # bf16 autocast; raise --micro-batch on cards with more headroom, or add more
+    # ranks (world) instead of raising grad_accum, to use extra GPUs.
     micro_batch = args.micro_batch or 1
-    grad_accum = args.grad_accum or (1 if args.smoke else 32)
+    if args.smoke:
+        grad_accum = args.grad_accum or 1
+    elif "ctx_cycle" in PHASES[args.phase]:
+        # mixed-length phases (stage3) ignore CLI micro/grad_accum entirely (see
+        # train()'s own NOTE log) -- train() reshards PHASES[...]["ctx_micro"]'s
+        # per-length accum by `world` itself. This value is unused; kept only so
+        # the function signature below stays uniform across phases.
+        grad_accum = args.grad_accum or 32
+    else:
+        # windows_per_step_target = GLOBAL_TOKENS_PER_STEP / ctx must be an
+        # integer (true for every ctx this recipe uses: 4096/8192/16384 all
+        # divide 131072), then (micro_batch, world) must divide THAT evenly --
+        # dist_util.assert_valid_world_config raises with the exact mismatch
+        # otherwise ("the launcher asserts... before launch", design section 6).
+        assert GLOBAL_TOKENS_PER_STEP % cfg.heal_ctx == 0, (
+            f"GLOBAL_TOKENS_PER_STEP={GLOBAL_TOKENS_PER_STEP} not divisible by "
+            f"cfg.heal_ctx={cfg.heal_ctx}")
+        windows_target = GLOBAL_TOKENS_PER_STEP // cfg.heal_ctx
+        expected_accum = dist_util.assert_valid_world_config(windows_target, micro_batch, world)
+        if args.grad_accum is not None:
+            grad_accum = args.grad_accum
+            # shakedown's mini training stage legitimately uses small custom
+            # micro/accum values that do NOT hold GLOBAL_TOKENS_PER_STEP (see
+            # gates.check_training) -- exempted the same way _data_guards exempts
+            # it. A real heal (scripts/heal.sh) never passes --shakedown.
+            if not args.shakedown and grad_accum != expected_accum:
+                log(f"ABORT: --grad-accum {grad_accum} breaks the tokens/step invariance "
+                    f"contract (micro_batch={micro_batch} world={world} ctx={cfg.heal_ctx} -> "
+                    f"expected grad_accum={expected_accum} for global tokens/step="
+                    f"{GLOBAL_TOKENS_PER_STEP}); omit --grad-accum to use the computed value, "
+                    "or pass --shakedown if this really is a shakedown mini-run")
+                sys.exit(1)
+        else:
+            grad_accum = expected_accum
     budget_s = args.budget_s or (600 if args.smoke else 20 * 3600)
     log(f"heal device={DEVICE} phase={args.phase} smoke={args.smoke} dtype={COMPUTE_DTYPE} "
-        f"attn_backend={resolve_backend(cfg)}")
+        f"attn_backend={resolve_backend(cfg)} rank={rank}/{world} local_rank={local_rank}")
 
     # ES-2 tombstone: fail fast, before spending any time on gates/donor loading
     # (train() re-checks this too -- see its docstring -- so this is belt only,
@@ -680,6 +1000,13 @@ def main():
         log("ABORT: data/train.bin missing -- run `python -m hba.data_prep` first"); sys.exit(1)
 
     if not args.skip_gates:
+        # Per-rank correctness gates (design section 5, gate 1): torchrun launches
+        # one independent process per rank, so simply running these gates in every
+        # process -- no special multi-GPU code needed here -- already satisfies
+        # "run identically on EVERY rank" and catches a single bad GPU (a rank
+        # whose kernels/driver silently produce wrong numbers fails its OWN gate
+        # run, right here, before that rank ever joins the DDP process group's
+        # first collective).
         from .gates import gate_equivalence
         gmodel, gtok, gcfg = build_hba(cfg, dtype=torch.float32)
         backend = resolve_backend(gcfg)
@@ -692,11 +1019,21 @@ def main():
         del gmodel
         empty_cache()
         if not ok:
-            log("CONVERSION GATES FAILED -- aborting heal (fake numbers otherwise)"); sys.exit(1)
+            # No barrier/broadcast here: this rank exits ALONE. Any rank whose
+            # gates passed continues past this block toward train()'s
+            # dist_util.wrap_ddp call, a collective (DDP's constructor
+            # broadcasts rank-0 params) -- with this rank gone, that collective
+            # has no matching peer and the surviving ranks hang until
+            # torchrun's health-check/timeout tears down the whole job. That
+            # teardown (not a clean collective abort here) is what actually
+            # ends the run.
+            log(f"CONVERSION GATES FAILED on rank {rank} -- aborting heal (fake numbers "
+                "otherwise)")
+            sys.exit(1)
 
     status = train(cfg, args.phase, args.resume, micro_batch, grad_accum, budget_s, args.smoke,
                    allow_small=args.allow_small_corpus, shakedown=args.shakedown,
-                   probe_every=args.probe_every)
+                   probe_every=args.probe_every, rank=rank, world=world, local_rank=local_rank)
     if status == "guard":
         log(f"[{args.phase}] NOT finished (wall-clock guard) -- rerun with --resume")
         sys.exit(3)

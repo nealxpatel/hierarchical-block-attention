@@ -236,6 +236,13 @@ def hba_attention_dense(q, k, v, cos, sin, cfg, summ, equiv=False):
         term = torch.where(pv > 0, pv * logp, torch.zeros_like(logp))
         aux = -term.sum(-1).mean()
     else:
+        # DDP interaction: no query in this call had any candidate block, so
+        # this returns a graph-free zero aux (no summarizer grad at all this
+        # step). Unreachable at recipe/smoke ctx (ctx >> window), but if a
+        # future config ever set heal_ctx <= window while summarizers are
+        # trainable, this would starve the summarizer of gradient every step
+        # and hang DDP's find_unused_parameters=False all-reduce -- see the
+        # assert in dist_util.wrap_ddp.
         aux = out.new_zeros(())
     return out, aux
 
@@ -386,6 +393,10 @@ def _aux_kl_chunked(q, k, bsc, cand, cfg):
         logp = torch.log_softmax(bv, dim=-1)
         term = torch.where(pv > 0, pv * logp, torch.zeros_like(logp))
         return -term.sum(-1).mean()
+    # DDP interaction: same "no candidate blocks" fallback as
+    # hba_attention_dense above -- graph-free zero aux, no summarizer grad
+    # this step. Unreachable at recipe/smoke ctx; see the comment there and
+    # the assert in dist_util.wrap_ddp.
     return q.new_zeros(())
 
 
