@@ -71,7 +71,8 @@ class HBAModel(nn.Module):
         n_all = sum(p.numel() for p in self.parameters())
         log(f"trainable groups={sorted(groups)}: {n_tr/1e6:.1f}M / {n_all/1e6:.1f}M params")
 
-    def forward(self, ids, cos, sin, cap, mode="eval", tail=None, loss_tgt=None):
+    def forward(self, ids, cos, sin, cap, mode="eval", tail=None, loss_tgt=None,
+               return_hidden=False):
         """tail: if set, apply the (huge, vocab-way) lm_head only to the last `tail`
         positions and return logits [B, tail, V]. Needle/induction answers cluster
         at the sequence end, so this avoids materializing [B, n, V]. None = full.
@@ -82,7 +83,15 @@ class HBAModel(nn.Module):
         is never materialized (at long context the fp32 logits alone can run into
         the tens of GiB before backward). EXACT math: per-chunk fp32 CE with
         reduction='sum', divided by the total position count == the same mean CE as
-        F.cross_entropy over full logits. Mutually exclusive with `tail`."""
+        F.cross_entropy over full logits. Mutually exclusive with `tail`.
+
+        return_hidden: if set, skip the lm_head entirely and return the POST-NORM,
+        PRE-lm_head hidden states [B, n, hidden] instead of logits or a loss. For
+        callers that want to run their own memory-safe CE (see
+        `hba.chunked_ce.chunked_cross_entropy`) against `self.lm_head.weight` /
+        `self.lm_head.bias` outside this function. Mutually exclusive with `tail`
+        and `loss_tgt`. Default False, so no existing call site's behavior
+        changes."""
         cfg = self.cfg
         B, n = ids.shape
         Hq, Hkv, dh = cfg.n_heads, cfg.n_kv, cfg.head_dim
@@ -125,6 +134,10 @@ class HBAModel(nn.Module):
                 auxes.append(aux)
         x = self.core.norm(x)
         self._last_aux = (sum(auxes) / len(auxes)) if auxes else None
+        if return_hidden:
+            assert tail is None and loss_tgt is None, \
+                "return_hidden is mutually exclusive with tail and loss_tgt"
+            return x
         if loss_tgt is not None:
             assert tail is None, "loss_tgt and tail are mutually exclusive"
             from torch.utils.checkpoint import checkpoint
