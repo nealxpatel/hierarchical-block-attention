@@ -1,0 +1,44 @@
+# Build context is the repo root (docker build -f docker/Dockerfile .) --
+# keep the image lean and avoid baking anything host-specific or large.
+.git/
+.gitignore
+
+# Checkpoints and model weights (never baked -- fetched/produced on-box)
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+checkpoints/
+weights/
+
+# Data and results (fetched from the bucket / produced by training at
+# provisioning+training time -- scripts/provision.sh, not the image)
+data/
+data_gpu/
+shards/
+*.bin
+*.npy
+*.arrow
+hf_cache/
+results/
+logs/
+runs/
+wandb/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local manifest artifacts (regenerated at build time / on-box, never baked
+# stale)
+manifest.sha256
+BUILD_MANIFEST_SHA.txt

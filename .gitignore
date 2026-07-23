@@ -22,6 +22,12 @@ results/
 wandb/
 *.jsonl
 
+# Generated manifests (scripts/make_manifest.sh; docker build time / on-box
+# provisioning time -- never hand-authored, never committed)
+manifest.sha256
+BUILD_MANIFEST_SHA.txt
+data_gpu/
+
 # Python
 __pycache__/
 *.py[cod]
