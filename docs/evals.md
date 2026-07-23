@@ -53,8 +53,21 @@ Caveat, stated plainly: the converted model received 575M tokens of continued tr
 | Method | 4K | 16K | 32K | 64K | 128K |
 |---|---|---|---|---|---|
 | HBA converted (healed at 4K, **pre length-curriculum**) | **0.493** | 0.0 | 0.0 | 0.0 | 0.0 |
+| HBA converted, **+ length-curriculum stage** (4K/8K/16K mix, 100M tok) | **0.499** | 0.021 | 0.0 | 0.0 | not rerun † |
 | Donor (native 32K) | 0.458 | 0.356 | 0.238 | 0.037 | 0.0 |
 | Donor + YaRN | — | — | — | 0.097 | **0.0** |
+
+† bounded by the measured zeros at 16-64K.
+
+The curriculum stage's clearest effect is on the **induction gate**, the substrate probe:
+at 2× the original healing context (8K), accuracy went **0.031 → 0.469** (dense-mode
+ceiling: 0.531) after 100M mixed-length tokens — while quality stayed at donor parity
+(held-out PPL within ~3% of the pre-curriculum checkpoint; HellaSwag/ARC-e unchanged
+or better). Repair tracked the training dose at each length: 8K (well-dosed) recovered
+fully; 16K (lightly dosed, retrieval mostly through routed blocks) moved only trace
+amounts; 32K (untrained) stayed at zero. Validation-scale dosing was deliberately small
+(~$1 of compute); the release-scale run budgets its curriculum stage by per-length dose
+accordingly.
 
 Read this table in both directions. At its healed length, HBA beats the donor. Beyond it, this pre-curriculum checkpoint collapses — the softmax-dilution calibration failure analyzed in [design.md](design.md), with the mechanism fully localized (the same weights retrieve at rank 1 in dense mode; selection is correct; only the union softmax's calibration fails). The length-curriculum stage of the recipe exists because of this row, and the release-scale run includes it. Note also the last column: **nothing retrieves at 128K** — the YaRN'd donor is at 0.097 by 64K and 0.0 at 128K — while HBA's per-query cost at 128K is unchanged from 4K. The needle/RULER rows below are the ones to watch.
 

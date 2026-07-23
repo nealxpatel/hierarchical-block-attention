@@ -62,6 +62,16 @@ Spec:
 - **Per-length capability panel:** during any heal, run capability probes at **1×, 2×, and 4× the current training context** on a fixed cadence (see Monitoring). Our validation run probed only at one short length and showed a perfect plateau while the model was cliffing at 2× — the cliff would have been visible within 200 steps with a length axis.
 - One probe-design trap: a "far retrieval" probe only exercises routing if the candidate block count exceeds `k` at the probe's context length — otherwise top-k selects every block and the probe degenerates into "attention works". Size probe contexts accordingly.
 
+**Dose-response (measured):** repair at each length tracks the gradient spent there, and
+only there. In our validation curriculum (4K/8K/16K mixed 1:1:2, 100M tokens), the 2×
+length recovered fully (induction 0.031 → 0.469, ≈ the dense-mode ceiling), the 4× length
+— which received light rehearsal density and depends mostly on routed-path retrieval —
+moved only marginally, and untrained lengths stayed at floor. Budget the stage by
+**per-length dose** (rehearsal density × steps at that length), not total tokens; expect
+mid-run oscillation across lengths while the LR is high (calibrations compete) and judge
+only the annealed endpoint. If serving 128K, the curriculum must reach lengths close to the serving
+regime — measured repair did not extrapolate meaningfully beyond the trained lengths.
+
 ## Monitoring: the capability panel is a first-class training signal
 
 Perplexity tells you the model is a fluent language model. It tells you nothing about whether the model can retrieve — a model can be fluent and a complete non-retriever, and a capability can be destroyed mid-run with no perplexity signature (both observed directly). Therefore:
