@@ -1,0 +1,12 @@
+# Pinned deps for reproducing the conversion recipe (docs/training-recipe.md).
+# On a CUDA box, install the matching CUDA build of torch first, then the rest.
+torch==2.10.0
+transformers==4.57.6
+tokenizers==0.22.2
+datasets==4.6.1
+numpy>=1.26,<3
+safetensors>=0.4
+huggingface-hub>=0.35
+# optional: lm-eval harness (src/hba/evals.py has a self-contained fallback if
+# this is absent)
+# lm-eval==0.4.9
