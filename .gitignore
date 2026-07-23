@@ -1,0 +1,35 @@
+# Checkpoints and model weights
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+checkpoints/
+weights/
+
+# Data
+data/
+shards/
+*.bin
+*.npy
+*.arrow
+hf_cache/
+
+# Logs and run artifacts
+logs/
+*.log
+runs/
+results/
+wandb/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
