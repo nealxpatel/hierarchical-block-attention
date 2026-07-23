@@ -29,9 +29,10 @@ WORKDIR /workspace/hba
 
 # gcc: triton/flex_attention JIT-compiles a kernel at RUNTIME (not just at
 # image build time) and needs a C compiler present in the container.
-# rclone: one of the two data-fetch backends scripts/provision.sh supports
-# (the other, boto3, is a pip dep below) -- baked so no network install is
-# needed for it at provisioning time either.
+# rclone: one of the two OPTIONAL bucket-fetch backends scripts/provision.sh
+# supports as a fallback when data isn't already rsync'd in (the other,
+# boto3, is a pip dep below) -- baked so no network install is needed for it
+# at provisioning time either, on the boxes that do use it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc rclone \
     && rm -rf /var/lib/apt/lists/*

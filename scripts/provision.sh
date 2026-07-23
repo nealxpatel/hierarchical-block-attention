@@ -2,7 +2,8 @@
 # Rent-to-ready entrypoint (docker/Dockerfile ENTRYPOINT; see docker/README.md
 # for the full flow and every env var below). Runs, in order:
 #   a. expected-manifest assert   b. env pin assert
-#   c. data fetch (skip if already verified)   d. fast shakedown
+#   c. data verify (launcher rsyncs data in beforehand; bucket fetch is an
+#      optional fallback if rsync'd data isn't present)   d. fast shakedown
 # Every step prints a PASS/FAIL line; ANY FAIL exits nonzero immediately. A
 # final GREEN/RED banner reports total elapsed time against the <=15 min
 # rent-to-shakedown-green target.
@@ -68,14 +69,28 @@ check_pin tokenizers "$A_TOKENIZERS" "$EXP_TOKENIZERS"
 [ "$PIN_MISMATCH" -eq 0 ] || fail "env pin mismatch -- image is stale. Rebake (docker/README.md); a network pip install during provisioning is NOT a valid fallback here."
 pass "env pin assert: torch=${A_TORCH} transformers=${A_TRANSFORMERS} tokenizers=${A_TOKENIZERS}"
 
-echo "======== STEP c: data fetch ========"
-# S3-compatible bucket, configured ONLY via env (never hardcoded): either
+echo "======== STEP c: data verify (rsync-primary; bucket fetch is the optional fallback) ========"
+# PRIMARY path: the operator's launcher rsyncs data_gpu/ (shards +
+# data_manifest.sha256) into place BEFORE invoking this script -- see the
+# private launch tooling's "data rsync" step, which runs over the same
+# rsync/ssh conventions as its code-overlay step. This step is therefore
+# VERIFY-ONLY by default: check data_gpu/ exists and verifies against
+# data_gpu/data_manifest.sha256; if clean, PASS immediately, no network I/O.
+#
+# OPTIONAL fallback: an S3-compatible bucket, configured ONLY via env (never
+# hardcoded) -- either
 #   DATA_REMOTE               a preconfigured rclone remote name, or
 #   DATA_ENDPOINT + DATA_BUCKET + DATA_ACCESS_KEY_ID + DATA_SECRET_ACCESS_KEY
+# This path only runs if data_gpu/ is missing/dirty AND one of the above is
+# configured -- it exists for operators who provision a bucket instead of (or
+# in addition to) rsyncing from their own machine (docker/README.md, "Data
+# provisioning"). If neither the rsync'd data nor a bucket is available, this
+# step FAILs with instructions rather than silently proceeding.
+#
 # data_gpu/ (not data/ -- HBA_DATA_DIR is exported to it below, per
-# src/hba/config.py's env-override convention) is skipped if already present
-# AND verified; the manifest is ALWAYS verified before proceeding, whether or
-# not a fetch happened, so a corrupt/tampered bucket object never trains
+# src/hba/config.py's env-override convention). The manifest is ALWAYS
+# verified before proceeding, whether the data arrived via rsync or a bucket
+# fetch, so a corrupt transfer or a tampered bucket object never trains
 # silently.
 mkdir -p data_gpu
 verify_data_manifest() {
@@ -83,16 +98,18 @@ verify_data_manifest() {
   ( cd data_gpu && sha256sum -c data_manifest.sha256 --status )
 }
 
-FETCHED=0
 if [ -n "$(ls -A data_gpu 2>/dev/null)" ] && verify_data_manifest; then
-  pass "data: data_gpu/ already present and verifies against data_manifest.sha256 -- skipping download"
+  pass "data: data_gpu/ already present and verifies against data_manifest.sha256 (rsynced by the launcher) -- no fetch needed"
 else
   if [ -n "${DATA_REMOTE:-}" ]; then
+    echo "  data_gpu/ missing or dirty -- DATA_REMOTE is set, falling back to the optional bucket fetch"
     command -v rclone >/dev/null 2>&1 || fail "DATA_REMOTE=${DATA_REMOTE} set but rclone is not on PATH (image is stale, rebake)"
     echo "  fetching via rclone remote '${DATA_REMOTE}'"
     rclone sync "${DATA_REMOTE}:" data_gpu/ || fail "rclone sync from remote '${DATA_REMOTE}' failed"
-    FETCHED=1
+    verify_data_manifest || fail "data_gpu/ does not verify against data_manifest.sha256 after the bucket fetch (corrupt transfer or a tampered bucket object) -- refusing to train on unverified data"
+    pass "data: bucket fetch complete and verifies against data_manifest.sha256"
   elif [ -n "${DATA_ENDPOINT:-}" ] || [ -n "${DATA_BUCKET:-}" ]; then
+    echo "  data_gpu/ missing or dirty -- DATA_ENDPOINT/DATA_BUCKET is set, falling back to the optional bucket fetch"
     : "${DATA_ENDPOINT:?DATA_ENDPOINT must be set alongside DATA_BUCKET for the S3-compatible fetch path}"
     : "${DATA_BUCKET:?DATA_BUCKET must be set alongside DATA_ENDPOINT}"
     : "${DATA_ACCESS_KEY_ID:?DATA_ACCESS_KEY_ID must be set for the S3-compatible fetch path}"
@@ -127,15 +144,13 @@ print(f"[data] fetched {n} objects from s3://{bucket} via {endpoint}")
 if n == 0:
     raise SystemExit(f"no objects found under s3://{bucket} -- check DATA_BUCKET/prefix")
 PY
-    FETCHED=1
+    verify_data_manifest || fail "data_gpu/ does not verify against data_manifest.sha256 after the bucket fetch (corrupt transfer or a tampered bucket object) -- refusing to train on unverified data"
+    pass "data: bucket fetch complete and verifies against data_manifest.sha256"
   else
-    fail "no data source configured -- set DATA_REMOTE (a preconfigured rclone remote) or DATA_ENDPOINT+DATA_BUCKET+DATA_ACCESS_KEY_ID+DATA_SECRET_ACCESS_KEY"
+    fail "data_gpu/ is missing or does not verify against data_manifest.sha256, and no bucket fallback is configured (DATA_REMOTE, or DATA_ENDPOINT+DATA_BUCKET+DATA_ACCESS_KEY_ID+DATA_SECRET_ACCESS_KEY). The launcher must rsync data_gpu/ (shards + data_manifest.sha256) to this box BEFORE invoking provision.sh -- re-run the launcher's data-rsync step (docker/README.md, \"Data provisioning\"). If you intend to use a bucket instead, set the DATA_* env and re-run."
   fi
-  [ "$FETCHED" -eq 1 ] && pass "data: fetch complete"
 fi
 
-verify_data_manifest || fail "data_gpu/ does not verify against data_manifest.sha256 (corrupt transfer, tampered bucket object, or a manifest that doesn't match what was fetched) -- refusing to train on unverified data"
-pass "data manifest verify: data_gpu/ matches data_manifest.sha256"
 export HBA_DATA_DIR="$(pwd)/data_gpu"
 
 echo "======== STEP d: fast shakedown ========"

@@ -21,8 +21,8 @@ provisioning into a set of assertions that either pass fast or fail loud.
 | Layer | Contents | Why baked |
 |---|---|---|
 | Base | `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime` (**runtime**, not `devel`) | torch 2.10 / cu128 pin; smaller than the devel image |
-| System deps | `gcc` (triton/`flex_attention` JIT-compiles a kernel at runtime and needs a C compiler in the container, not just at build time), `rclone` (one data-fetch backend) | avoids a runtime apt-get |
-| Python deps | pinned `docker/requirements.txt` (`transformers==4.57.6`, `tokenizers==0.22.2`, `datasets==4.6.1`, `numpy`, `boto3` — the other data-fetch backend); `torchvision`/`torchaudio` uninstalled (unneeded, saves space) | eliminates the pip-install step entirely at provisioning time |
+| System deps | `gcc` (triton/`flex_attention` JIT-compiles a kernel at runtime and needs a C compiler in the container, not just at build time), `rclone` (one optional bucket-fetch backend, see "Data provisioning" below) | avoids a runtime apt-get |
+| Python deps | pinned `docker/requirements.txt` (`transformers==4.57.6`, `tokenizers==0.22.2`, `datasets==4.6.1`, `numpy`, `boto3` — the other optional bucket-fetch backend); `torchvision`/`torchaudio` uninstalled (unneeded, saves space) | eliminates the pip-install step entirely at provisioning time |
 | Donor | HF cache (`HF_HOME=/workspace/hf`) with `Qwen/Qwen2.5-0.5B-Instruct` + tokenizer | removes a flaky, first-run HF download from every provisioning run |
 | Code | `src/`, `scripts/`, `docs/`, `docker/`, `pyproject.toml`, `README.md` copied to `/workspace/hba`; `manifest.sha256` generated in-image via `scripts/make_manifest.sh` at build time; package installed with `pip install --no-deps -e .` | the code-overlay/manifest-verify flow below needs a baseline to diff and verify against |
 | Entrypoint | `scripts/provision.sh` | one command, rent to verdict |
@@ -84,21 +84,53 @@ network pip install during provisioning is a FAIL, not a fallback:** if the
 pins don't match, the image is stale and the fix is to rebake (below), not to
 patch a running box.
 
-**c. Data fetch.** Configured only via environment (never hardcoded, never
-committed):
+**c. Data verify.** This step is **verify-only by default**: check that
+`data_gpu/` exists and verifies against `data_gpu/data_manifest.sha256`; if
+clean, PASS with no network I/O at all. Getting the data into `data_gpu/` in
+the first place is the caller's job, done *before* `provision.sh` runs — see
+"Data provisioning" below for the two ways to do that.
+
+If `data_gpu/` is missing or fails verification, this step falls back to an
+**optional** bucket fetch, but only if bucket env is configured:
 
 - `DATA_REMOTE` — a preconfigured `rclone` remote name, **or**
 - `DATA_ENDPOINT` + `DATA_BUCKET` + `DATA_ACCESS_KEY_ID` +
   `DATA_SECRET_ACCESS_KEY` — any S3-compatible bucket (Cloudflare R2, Backblaze
   B2, MinIO, actual S3), fetched via `boto3` against `endpoint_url`.
 
-Skips the download if `data_gpu/` is already present **and** verifies against
-`data_gpu/data_manifest.sha256`; the data manifest is **always** re-verified
-before proceeding (whether or not a fetch just happened), so a corrupt
-transfer or a tampered bucket object never trains silently. On success,
-`HBA_DATA_DIR` is exported to `data_gpu/` (the env-override
+If `data_gpu/` is missing/dirty **and** no bucket env is set, this step FAILs
+with a message pointing back at the launcher's data-rsync step — there is no
+silent "just proceed without data" path. Whichever way the data arrived (a
+launcher rsync before this script ran, or the optional bucket fallback inside
+it), the data manifest is **always** re-verified before proceeding, so a
+corrupt transfer or a tampered bucket object never trains silently. On
+success, `HBA_DATA_DIR` is exported to `data_gpu/` (the env-override
 `src/hba/config.py` and `scripts/shakedown.sh` already support) so the rest of
-the pipeline picks the fetched data up automatically.
+the pipeline picks the data up automatically.
+
+## Data provisioning
+
+**Primary: operator-side rsync at launch time.** The private launch tooling
+rsyncs the local data shards + `data_manifest.sha256` into the instance's
+`data_gpu/` *before* invoking `provision.sh` (same rsync/ssh conventions as
+the code-overlay step) — by the time step c above runs, the data is already
+there and verify-only PASSes immediately. This requires the operator's
+machine to be online for the transfer: the first push to a fresh instance
+moves the full shard set (currently on the order of 1.6 GB); rsync's delta
+transfer means a re-rent of the *same* instance, or any instance that already
+has a prior push, costs close to nothing on subsequent launches.
+
+**Optional alternative: bucket fetch.** The `DATA_REMOTE` /
+`DATA_ENDPOINT`+`DATA_BUCKET`+`DATA_ACCESS_KEY_ID`+`DATA_SECRET_ACCESS_KEY` env
+vars and the `rclone`/`boto3` fetch code above still work standalone — set
+them and step c fetches from the bucket instead of requiring a prior rsync.
+This trades the operator's machine/upload out of the critical path (useful if
+provisioning needs to run fully unattended, or once shard sizes grow enough —
+roughly 5–10× — that a home upload stops being the cheap side of the
+tradeoff) for the cost and setup of maintaining a bucket account. Worth
+revisiting if either of those conditions changes; until then, rsync is
+primary because it needs no bucket account and the operator's machine is
+already assumed to be available at launch time.
 
 **d. Fast shakedown.** Runs `scripts/shakedown.sh --fast` (below) and reports
 the final banner.
@@ -109,8 +141,8 @@ the final banner.
 |---|---|---|
 | `EXPECTED_MANIFEST_SHA` | yes | launcher-computed code manifest hash (step a) |
 | `HBA_PINNED_TORCH` | baked by the image | expected torch version (step b) |
-| `DATA_REMOTE` | one of this or the four below | preconfigured rclone remote name (step c) |
-| `DATA_ENDPOINT`, `DATA_BUCKET`, `DATA_ACCESS_KEY_ID`, `DATA_SECRET_ACCESS_KEY` | one of the four or `DATA_REMOTE` | S3-compatible bucket credentials (step c) |
+| `DATA_REMOTE` | no (optional bucket fallback) | preconfigured rclone remote name; only consulted if `data_gpu/` isn't already present+verified (step c) |
+| `DATA_ENDPOINT`, `DATA_BUCKET`, `DATA_ACCESS_KEY_ID`, `DATA_SECRET_ACCESS_KEY` | no (optional bucket fallback) | S3-compatible bucket credentials; only consulted if `data_gpu/` isn't already present+verified (step c) |
 | `PLANNED_TPS` | no (baked default `13600`) | passed through to `scripts/shakedown.sh` / `hba.gates` for the throughput abort check |
 | `PIP_BREAK_SYSTEM_PACKAGES`, `PYTORCH_ALLOC_CONF`, `HF_HOME`, `HF_HUB_OFFLINE` | baked | see `docker/Dockerfile`; not operator-set |
 
@@ -123,7 +155,7 @@ doesn't need to re-prove things `provision.sh`'s earlier steps already proved:
 | Step | Full (default) | `--fast` |
 |---|---|---|
 | pip install | pinned deps + `-e .` | **skipped** (pins already verified by provision.sh step b; a pip install here would be a network dependency the whole point of the image is to avoid) |
-| data | generates a small slice if missing | **no download** — presence-only check (provision.sh step c already fetched + verified it) |
+| data | generates a small slice if missing | **no download** — presence-only check (provision.sh step c already verified it, whether the data arrived via the launcher's rsync or the optional bucket fallback) |
 | fp32 correctness gates + G1 induction | run | run, unchanged (~4 min) — this is exactly the correctness surface that must never be skipped before training runs on a new box |
 | training measurement | 150 steps | **50 steps**, with the tok/s window **excluding the first ~10 steps** (compile/autotune warmup) — see below |
 | eval | 1 PPL cell + 1 needle cell | **1 PPL cell only** (~1 min budget) |
@@ -177,8 +209,12 @@ Below that threshold, overlay + on-box manifest regeneration + the launcher's
 
 ## The ≤ 15 min target
 
-Steps a–c (manifest assert, pin assert, data fetch-or-verify) are each on the
-order of a minute; step d (`--fast` shakedown) is the remaining ~9 minutes
-(4 min correctness gates + 3 min training measurement + 1 min PPL + change).
-`scripts/provision.sh` prints the total elapsed time in its final banner so
-this is measured, not assumed, on every box.
+Steps a–c (manifest assert, pin assert, data verify-or-fetch) are each on the
+order of a minute *given data already rsync'd in* — step c is a fast
+presence+manifest check in that case; step d (`--fast` shakedown) is the
+remaining ~9 minutes (4 min correctness gates + 3 min training measurement +
+1 min PPL + change). `scripts/provision.sh` prints the total elapsed time in
+its final banner so this is measured, not assumed, on every box. Note the
+launcher's data-rsync step itself (before `provision.sh` even starts) is
+*not* included in this on-box banner — see `infra-fast-rig/VALIDATION.md` in
+the private repo for how that leg is tracked separately for a fresh instance.
