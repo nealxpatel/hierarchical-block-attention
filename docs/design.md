@@ -32,6 +32,31 @@ attn(q) = softmax_over( {q·k_i : i ∈ sinks} ∪ {q·k_i^RoPE : i ∈ window} 
 
 In a fused implementation this is computed as a **log-sum-exp merge** of two attention calls — one NoPE region (sinks + routed blocks) and one RoPE sliding-window region — which avoids materializing any `n×n` tensor and yielded a 5.3× end-to-end training speedup over the naive path in our implementation (agreement with the naive reference ~1e-6).
 
+### Design note: why the window keeps RoPE
+
+HBA removes positional encoding from **long range** — where extrapolation beyond training
+offsets is what breaks length generalization — not from the model. Inside the window it is
+kept, deliberately:
+
+- **Local order carries meaning.** Syntax, negation, and adjacency are genuinely
+  position-dependent; measured attention in pretrained models is position-structured
+  locally and content-addressed at distance. The decomposition mirrors that split.
+- **Confined RoPE cannot extrapolate.** With relative offsets capped at `W`, the rotary
+  computation is permanently in-distribution at any sequence length. The failure mode is
+  amputated; the mechanism is not.
+- **Conversion economics.** A pretrained donor's local attention behavior lives in its
+  RoPE'd Q/K geometry. Keeping window RoPE means that behavior transfers intact, which is
+  a large part of why the attention-only healing stage is cheap. Replacing it would mean
+  relearning local attention — the expensive part — from scratch.
+
+Concurrent from-scratch work (Thinking Machines' Inkling) makes the other choice: a
+learnt, content-dependent additive distance bias over the same-sized local window, with no
+rotary embeddings anywhere. That is a defensible design when pretraining from scratch and
+plausibly more expressive, at a higher kernel cost (the bias must be materialized inside
+the attention tile loop). For converting existing checkpoints, window-RoPE is the
+pragmatic optimum. The accurate summary of both designs is the same: **no positional
+encoding beyond the local window.**
+
 ## Slot summarizers
 
 Mean-pooling blocks into single vectors is a demonstrably weak router (see README principle 3). Instead, each (layer, KV head) owns a **SlotSummarizer**: `m` learned probe vectors that cross-attend into the block's keys, producing `m` slot vectors per block. A block's routing score for query `q` is:
