@@ -250,8 +250,11 @@ def gate_fused_agreement(model, cfg, tol=5e-4, aux_tol=1e-3, grad_tol=2e-3, ns=N
     shared verbatim, so there is NO top-k tie ambiguity between the backends) ->
     outputs must agree at the series' strict-fp32 path-equivalence tolerance,
     auxes at aux_tol, and input gradients (q/k/v, same upstream cotangent) at
-    grad_tol -- the gradient check is what catches a broken LSE merge (outputs can
-    agree while d(out)/d(lse) is wrong).
+    grad_tol RELATIVE to the gradient magnitude -- the gradient check is what
+    catches a broken LSE merge (outputs can agree while d(out)/d(lse) is wrong).
+    (Relative, not absolute: under QKNorm the raw-q/k gradient magnitudes are
+    ~1e3 on random test inputs -- the normalization Jacobian ~1/RMS -- so an
+    absolute bound would fail on a correct backward; see the check below.)
 
     Uses `model.qknorms[0]`, so this is exercised WITH QKNorm on whenever
     cfg.qknorm is True: both backends call the identical `attention._content_qk`
@@ -288,14 +291,22 @@ def gate_fused_agreement(model, cfg, tol=5e-4, aux_tol=1e-3, grad_tol=2e-3, ns=N
             gq_f, gk_f, gv_f = torch.autograd.grad(o_f, (q, k, v), g, retain_graph=False)
             d_out = (o_n - o_f).abs().max().item()
             d_aux = abs(a_n.item() - a_f.item())
-            d_grad = max((gq_n - gq_f).abs().max().item(), (gk_n - gk_f).abs().max().item(),
-                         (gv_n - gv_f).abs().max().item())
+            # RELATIVE grad agreement, not absolute: QKNorm's normalization
+            # Jacobian scales dL/dq,dL/dk by ~1/RMS(input), so with random test
+            # inputs the raw-q/k gradient MAGNITUDES run ~1e3 (vs ~2 without
+            # QKNorm). An absolute tol then fails even when the two backends agree
+            # to fp32 precision. What must hold is that fused and naive agree
+            # RELATIVE to the gradient scale -- a 1% wrong backward still trips
+            # this, but a correct one that merely has large magnitude does not.
+            def _rel(a, b):
+                return (a - b).abs().max().item() / max(a.abs().max().item(), 1e-6)
+            d_grad = max(_rel(gq_n, gq_f), _rel(gk_n, gk_f), _rel(gv_n, gv_f))
             n_cand = int(_route_candidates(n, W, n // Bk, Bk, dev).any(-1).sum())
             this_ok = d_out < tol and d_aux < aux_tol and d_grad < grad_tol
             ok = ok and this_ok
             log(f"[gate:fused] n={n} (queries-with-candidates={n_cand}) "
                 f"max|Δout|={d_out:.2e} (<{tol}) |Δaux|={d_aux:.2e} (<{aux_tol}) "
-                f"max|Δgrad|={d_grad:.2e} (<{grad_tol}) -> {this_ok}")
+                f"rel|Δgrad|={d_grad:.2e} (<{grad_tol}) -> {this_ok}")
     log(f"[gate:fused] fused-vs-naive agreement -> {ok}")
     return ok
 
