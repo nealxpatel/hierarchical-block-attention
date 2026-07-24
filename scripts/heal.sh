@@ -28,14 +28,14 @@ sys.path.insert(0, "src")
 from hba.heal import GLOBAL_TOKENS_PER_STEP
 from hba.dist_util import assert_valid_world_config
 world = int(sys.argv[1])
-for ctx in (4096, 8192, 16384):        # every ctx this recipe's phases use
+for ctx in (4096, 8192, 16384, 32768):  # every ctx this recipe's phases use
     assert GLOBAL_TOKENS_PER_STEP % ctx == 0
     wps = GLOBAL_TOKENS_PER_STEP // ctx
     # micro_batch=1 is the loosest constraint (largest set of valid worlds);
     # heal.py's own main() re-validates against the ACTUAL --micro-batch at
     # launch time -- this is the fast early sanity check, not the only gate.
     assert_valid_world_config(wps, micro_B=1, world=world)
-print(f"WORLD={world}: tokens/step divisibility OK for ctx in (4096, 8192, 16384)")
+print(f"WORLD={world}: tokens/step divisibility OK for ctx in (4096, 8192, 16384, 32768)")
 PY
   LAUNCH=(torchrun --standalone --nproc_per_node="$WORLD")
   echo "[heal] multi-GPU: WORLD=$WORLD (torchrun --standalone --nproc_per_node=$WORLD)"

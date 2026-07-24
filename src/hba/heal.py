@@ -156,11 +156,20 @@ PHASES = {
     # length induction dose-response (docs/training-recipe.md, "Length
     # curriculum") is an evals.py / offline concern for this stage, not this
     # panel's job.
+    # Native-length curriculum: reaches the donor's native 32K (n_cal), where the
+    # union-softmax calibration must form for the PRIMARY objective. The cycle is
+    # 32K-weighted (50% of steps) but keeps 4K/8K/16K represented so short-context
+    # calibration is not forgotten while the long one settles; it ends long. Per
+    # length (micro, accum) holds global tokens/step at 131072 and divides evenly
+    # for world in {1,2,4} (32768 has windows_per_step=4, so micro=1 is forced at
+    # world=4 -- fine on 80GB-class cards). Within n_cal the temperature is
+    # identity, so this whole stage trains at tau=1: it tests the QKNorm
+    # architecture, not the extrapolation knob.
     "stage3": dict(trainable={"attn", "mlp", "norms", "embed"},
-                   tokens=1.0e8, lr=2e-5, warmup=100, fam_frac=0.026, probe_every=200,
+                   tokens=2.0e8, lr=2e-5, warmup=100, fam_frac=0.026, probe_every=200,
                    aux_off=True,
-                   ctx_cycle=(4096, 16384, 8192, 16384),
-                   ctx_micro={4096: (2, 16), 8192: (1, 16), 16384: (1, 8)},
+                   ctx_cycle=(4096, 32768, 8192, 32768, 16384, 32768),
+                   ctx_micro={4096: (4, 8), 8192: (2, 8), 16384: (2, 4), 32768: (1, 4)},
                    comm_dtype="bf16"),
 }
 
