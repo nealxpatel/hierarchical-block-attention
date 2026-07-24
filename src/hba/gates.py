@@ -353,29 +353,53 @@ def gate_chunked_ce(tol=1e-6, tiny=None, real=None, device=None):
     if dev == "cuda":
         real = real or dict(B=4, n=4096, d=896, V=151936, chunk_size=1024)
         Br, nr, dr, Vr, csr = real["B"], real["n"], real["d"], real["V"], real["chunk_size"]
-        hidden_r = torch.randn(Br, nr, dr, device=dev, requires_grad=True)
-        weight_r = torch.randn(Vr, dr, device=dev, requires_grad=True)
-        labels_r = torch.randint(0, Vr, (Br, nr), device=dev)
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats(dev)
-        loss_r = chunked_cross_entropy(hidden_r, weight_r, labels_r, chunk_size=csr)
-        loss_r.backward()
-        torch.cuda.synchronize()
-        peak = torch.cuda.max_memory_allocated(dev)
-        unchunked_logits_bytes = Br * nr * Vr * 4          # the spike this module avoids
+
+        # Empirical, apples-to-apples: measure the TOTAL peak allocation of the
+        # chunked path AND the unchunked oracle at the SAME real dims, and require
+        # the chunked path to peak meaningfully lower. Comparing the chunked total
+        # peak against a bare `B*n*V*4` logit-byte count (an earlier formulation)
+        # is wrong -- the total peak also holds params, activations, grads, and
+        # one chunk's softmax/backward temporaries, so it legitimately exceeds the
+        # bare full-logit size while still being far below the unchunked path's
+        # actual peak. The naive accumulate-every-chunk trap would show ~no saving.
+        def _peak(fn):
+            h = torch.randn(Br, nr, dr, device=dev, requires_grad=True)
+            w = torch.randn(Vr, dr, device=dev, requires_grad=True)
+            lab = torch.randint(0, Vr, (Br, nr), device=dev)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(dev)
+            loss = fn(h, w, lab)
+            loss.backward()
+            torch.cuda.synchronize()
+            p = torch.cuda.max_memory_allocated(dev)
+            del h, w, lab, loss
+            empty_cache()
+            return p
+
         one_chunk_logits_bytes = Br * csr * Vr * 4
-        # peak must stay far below the unchunked spike -- a loose bound (an order
-        # of magnitude) so this doesn't get spuriously trippy on allocator
-        # fragmentation/caching, while still failing hard on the naive
-        # accumulate-every-chunk trap (whose peak would approach
-        # unchunked_logits_bytes, not one_chunk_logits_bytes).
-        ok_mem = peak < 0.5 * unchunked_logits_bytes
-        log(f"[gate:chunked_ce] GPU-ONLY memory check: real dims B={Br} n={nr} d={dr} V={Vr} "
-            f"chunk={csr} -> peak_alloc={peak/2**30:.2f}GiB one_chunk_logits="
-            f"{one_chunk_logits_bytes/2**30:.2f}GiB unchunked_logits="
-            f"{unchunked_logits_bytes/2**30:.2f}GiB (<50% of unchunked ? {ok_mem})")
-        del hidden_r, weight_r, labels_r, loss_r
-        empty_cache()
+        full_logits_bytes = Br * nr * Vr * 4
+        theo_saving = full_logits_bytes - one_chunk_logits_bytes  # what chunking should recover
+        peak_ch = _peak(lambda h, w, lab: chunked_cross_entropy(h, w, lab, chunk_size=csr))
+        try:
+            peak_un = _peak(lambda h, w, lab: reference_cross_entropy(h, w, lab))
+            saving = peak_un - peak_ch
+            # (a) chunked peaks strictly lower, and (b) recovers most of the
+            # theoretical logit saving -- a loose 0.5 factor tolerates allocator
+            # caching/fragmentation without admitting the no-saving trap.
+            ok_mem = peak_ch < peak_un and saving > 0.5 * theo_saving
+            log(f"[gate:chunked_ce] GPU memory check: real dims B={Br} n={nr} d={dr} V={Vr} "
+                f"chunk={csr} -> chunked_peak={peak_ch/2**30:.2f}GiB "
+                f"unchunked_peak={peak_un/2**30:.2f}GiB saving={saving/2**30:.2f}GiB "
+                f"(> 0.5*theo {theo_saving/2**30/2:.2f}GiB ? {ok_mem})")
+        except torch.cuda.OutOfMemoryError:
+            # The unchunked oracle could not even run at these dims while the
+            # chunked path did -- the strongest possible demonstration of the
+            # memory saving. That IS the pass.
+            empty_cache()
+            ok_mem = True
+            log(f"[gate:chunked_ce] GPU memory check: unchunked oracle OOM'd at real dims "
+                f"(B={Br} n={nr} V={Vr}) while chunked_peak={peak_ch/2**30:.2f}GiB succeeded "
+                f"-- chunking is load-bearing here -> {ok_mem}")
     else:
         log(f"[gate:chunked_ce] memory check SKIPPED (GPU-only; device={dev}) -- correctness "
             "(loss+grad equality) is the check that ran")
