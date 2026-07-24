@@ -63,7 +63,17 @@ check_pin() {  # name actual expected
     echo "  ok   pin $1: $2"
   fi
 }
-check_pin torch "$A_TORCH" "$EXP_TORCH"
+# torch carries a local-version build suffix (e.g. 2.10.0+cu128) that the base
+# image tag fixes -- the CUDA build is pinned by the FROM line, so the version
+# pin asserts the BASE version. Match the base (strip +local) unless the
+# operator deliberately pinned the exact build in HBA_PINNED_TORCH.
+A_TORCH_BASE="${A_TORCH%%+*}"
+if [ "$A_TORCH" = "$EXP_TORCH" ] || [ "$A_TORCH_BASE" = "$EXP_TORCH" ]; then
+  echo "  ok   pin torch: $A_TORCH"
+else
+  echo "  FAIL pin torch: actual=$A_TORCH (base $A_TORCH_BASE) expected=$EXP_TORCH"
+  PIN_MISMATCH=1
+fi
 check_pin transformers "$A_TRANSFORMERS" "$EXP_TRANSFORMERS"
 check_pin tokenizers "$A_TOKENIZERS" "$EXP_TOKENIZERS"
 [ "$PIN_MISMATCH" -eq 0 ] || fail "env pin mismatch -- image is stale. Rebake (docker/README.md); a network pip install during provisioning is NOT a valid fallback here."
