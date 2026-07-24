@@ -9,6 +9,7 @@ re-deriving them.
 import os
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -135,6 +136,42 @@ class HBAConfig:
     # ---- healing ----
     heal_ctx: int = 4096       # base heal context (window 1024 -> candidate blocks @ heal_ctx)
     mem_elem_cap: float = 1.0e8
+    # ---- softmax length-calibration (docs/design.md, "Softmax length-
+    # calibration"; the Inkling essay https://idlemachines.co.uk/essays/inkling
+    # and the Scalable-Softmax paper arXiv:2501.19399) ----
+    # QKNorm: per-head RMS-normalize q/k (+ a learned per-head SCALAR gain)
+    # before the content dot product, so q.k = gain_q*gain_k*dh*cos(theta) --
+    # bounded independent of head_dim -- shared identically by the RoPE-window,
+    # NoPE-sink, and NoPE-routed branches of the union softmax (attention.py's
+    # `_content_qk`/`QKNorm`). Default ON for the new architecture.
+    # qknorm=False takes the ORIGINAL, pre-QKNorm code path byte-for-byte (raw
+    # q/k, scale=dh**-0.5, no length temperature) -- the ablation/regression
+    # mode gate_equivalence still holds exactly under.
+    qknorm: bool = True
+    # content_scale_mode: only consulted when qknorm=True (see content_scale()).
+    # 'inv_d'      -- 1/d: the calibrated scale QKNorm is derived for (q.k/d =
+    #                 gain_q*gain_k*cos(theta), bounded regardless of dh).
+    # 'inv_sqrt_d' -- legacy 1/sqrt(d): QKNorm without the 1/d half of the fix,
+    #                 an ablation to isolate which half of the recipe matters.
+    content_scale_mode: str = "inv_d"
+    # Clamped log-length temperature (attention.log_len_tau): tau =
+    # 1 + temp_c*log(max(n/n_cal, 1)) multiplies the content scale, i.e. it
+    # SHARPENS logits (temp_c>=0 -> tau>=1) as served length n exceeds n_cal --
+    # counteracting union-softmax dilution from a growing candidate crowd (the
+    # SSMax mechanism). IDENTITY (tau=1 exactly, log(1)=0) for any n <= n_cal --
+    # within n_cal, QKNorm + content_scale is what calibrates the softmax; this
+    # temperature is the EXTRAPOLATION knob for n > n_cal only. Gated under
+    # qknorm (see log_len_tau/_content_qk): with qknorm=False this is inert, so
+    # the byte-identical regression mode is unaffected by these defaults.
+    temp_c: float = 0.1
+    # n_cal: the served-length calibration boundary for the temperature above.
+    # None -> defaults to native_ctx (the donor's own native/trained context;
+    # 32768 for the 0.5B validation donor and the primary 32K-native release
+    # target) -- i.e. by default the temperature is identity through the whole
+    # native context and only grows when actually extrapolating past it.
+    # Override explicitly (e.g. to heal_ctx) for a run whose calibration length
+    # differs from native_ctx.
+    n_cal: Optional[int] = None
     # ---- train-path attention backend ----
     # 'fused' = FlexAttention LSE-merge (no n^2 tensor materialized; the throughput
     # path on CUDA/CPU). 'naive' = the materialized-scores path, kept FOREVER as the

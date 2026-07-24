@@ -1134,10 +1134,17 @@ def _heal_main(args, rank, world, local_rank):
         # whose kernels/driver silently produce wrong numbers fails its OWN gate
         # run, right here, before that rank ever joins the DDP process group's
         # first collective).
-        from .gates import gate_equivalence
+        from .gates import gate_equivalence, gate_qknorm_math
         gmodel, gtok, gcfg = build_hba(cfg, dtype=torch.float32)
         backend = resolve_backend(gcfg)
-        ok = (gate_equivalence(gmodel, gtok, gcfg)[0] and gate_causality(gmodel, gcfg)
+        # gate_equivalence (donor-equivalence) is only meaningful with
+        # cfg.qknorm=False -- see that gate's docstring and gates.run_all_gates'
+        # docstring for the full split. qknorm=True runs gate_qknorm_math (the
+        # internal-consistency check) in its place instead of silently skipping
+        # the swap-correctness question.
+        ok_e = True if gcfg.qknorm else gate_equivalence(gmodel, gtok, gcfg)[0]
+        ok_qk = gate_qknorm_math(gmodel, gcfg) if gcfg.qknorm else True
+        ok = (ok_e and ok_qk and gate_causality(gmodel, gcfg)
               and gate_path_equivalence(gmodel, gcfg) and gate_grad_isolation(gmodel, gcfg))
         if ok and backend == "fused":
             # the fused backend must agree with the naive oracle + keep gradient isolation

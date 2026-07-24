@@ -69,7 +69,19 @@ class strict_fp32:
 def gate_equivalence(model, tok, cfg, n=256, tol=2e-3):
     """The swap wiring is correct iff the HBA forward in `equiv` mode reproduces
     the donor's own logits (uniform-RoPE, route-everything limit). Run both in
-    fp32 for a tight bound. docs/training-recipe.md, "Equivalence gate"."""
+    fp32 for a tight bound. docs/training-recipe.md, "Equivalence gate".
+
+    ONLY MEANINGFUL WITH cfg.qknorm=False. QKNorm (docs/design.md, "Softmax
+    length-calibration") is a deliberate architectural departure from the
+    donor's Q/K statistics -- with cfg.qknorm=True this gate is EXPECTED to
+    fail (the whole point of QKNorm is that q.k is no longer the donor's own
+    q.k), so `run_all_gates`/`check_gates` skip calling this gate at all when
+    qknorm is on and run `gate_qknorm_math` instead (the qknorm=ON internal-
+    consistency check: the model's own QKNorm math matches a transparent
+    reference implementation, and the fused-vs-naive / dense-vs-eval agreement
+    gates, run unconditionally regardless of qknorm, cover the rest of "the
+    QKNorm path is internally consistent"). Call this function directly (as the
+    qknorm=OFF regression check) to prove the non-QKNorm swap is still exact."""
     dev = next(model.parameters()).device
     ids = torch.randint(0, cfg.vocab_size, (1, n), device=dev)
     cos, sin = rope_tables(n, cfg.head_dim, cfg.rope_theta, dev)
@@ -130,10 +142,11 @@ def gate_grad_isolation(model, cfg, n=None, backend="naive"):
     v = torch.randn(1, n, Hkv, dh, device=dev, requires_grad=True)
     cos, sin = rope_tables(n, cfg.head_dim, cfg.rope_theta, dev)
     summ = model.summarizers[0]
+    qkn = model.qknorms[0]
     for p in summ.parameters():
         p.grad = None
     attn = hba_attention_fused if backend == "fused" else hba_attention_dense
-    out, aux = attn(q, k, v, cos, sin, cfg, summ)
+    out, aux = attn(q, k, v, cos, sin, cfg, summ, qkn)
     aux.backward(retain_graph=True)
     g_qkv_aux = max(float(t.grad.abs().max()) if t.grad is not None else 0.0 for t in (q, k, v))
     g_sum_aux = max(float(p.grad.abs().max()) if p.grad is not None else 0.0
@@ -207,15 +220,16 @@ def gate_path_equivalence(model, cfg, n=None, tol=5e-4, flip_frac_tol=0.01, flip
             k = lyr.self_attn.k_proj(a).view(1, n, Hkv, dh)
             v = lyr.self_attn.v_proj(a).view(1, n, Hkv, dh)
             summ = model.summarizers[L]
+            qkn = model.qknorms[L]
             # (a) selection-agnostic math check
             from .attention import hba_attention_eval
-            oda, _ = hba_attention_dense(q, k, v, cos, sin, cfg_all, summ)
-            oea = hba_attention_eval(q, k, v, cos, sin, cfg_all, summ, cfg.mem_elem_cap)
+            oda, _ = hba_attention_dense(q, k, v, cos, sin, cfg_all, summ, qkn)
+            oea = hba_attention_eval(q, k, v, cos, sin, cfg_all, summ, qkn, cfg.mem_elem_cap)
             worst_math = max(worst_math, float((oda - oea).abs().max()))
             del oda, oea
             # (b) real-cfg selection-stability check
-            od, _ = hba_attention_dense(q, k, v, cos, sin, cfg, summ)
-            oe = hba_attention_eval(q, k, v, cos, sin, cfg, summ, cfg.mem_elem_cap)
+            od, _ = hba_attention_dense(q, k, v, cos, sin, cfg, summ, qkn)
+            oe = hba_attention_eval(q, k, v, cos, sin, cfg, summ, qkn, cfg.mem_elem_cap)
             per_pos = (od - oe).abs().amax(dim=(0, 2, 3))                       # [n]
             worst_flip_frac = max(worst_flip_frac, float((per_pos > tol).float().mean()))
             worst_flip_diff = max(worst_flip_diff, float(per_pos.max()))
@@ -239,6 +253,12 @@ def gate_fused_agreement(model, cfg, tol=5e-4, aux_tol=1e-3, grad_tol=2e-3, ns=N
     grad_tol -- the gradient check is what catches a broken LSE merge (outputs can
     agree while d(out)/d(lse) is wrong).
 
+    Uses `model.qknorms[0]`, so this is exercised WITH QKNorm on whenever
+    cfg.qknorm is True: both backends call the identical `attention._content_qk`
+    helper, so this gate stays the load-bearing "the two backends implement
+    QKNorm identically" check (docs/design.md, "Softmax length-calibration") --
+    not just "the two backends agree on the pre-QKNorm math".
+
     Sizes exercise the edge cases: n < W (window covers everything -> ZERO routed
     candidates, region A = sinks only), a mid n that is NOT a multiple of flex's
     128 kernel block with real top-k routing active, and the full heal ctx. The
@@ -252,6 +272,7 @@ def gate_fused_agreement(model, cfg, tol=5e-4, aux_tol=1e-3, grad_tol=2e-3, ns=N
                      (2 * W + 3 * Bk) // Bk * Bk,          # % 128 != 0, routing active
                      cfg.heal_ctx})                        # the real training size
     summ = model.summarizers[0]
+    qkn = model.qknorms[0]
     ok = True
     with strict_fp32():
         for n in ns:
@@ -261,9 +282,9 @@ def gate_fused_agreement(model, cfg, tol=5e-4, aux_tol=1e-3, grad_tol=2e-3, ns=N
             v = torch.randn(1, n, Hkv, dh, device=dev, requires_grad=True)
             cos, sin = rope_tables(n, cfg.head_dim, cfg.rope_theta, dev)
             g = torch.randn(1, n, Hq, dh, device=dev)
-            o_n, a_n = hba_attention_dense(q, k, v, cos, sin, cfg, summ)
+            o_n, a_n = hba_attention_dense(q, k, v, cos, sin, cfg, summ, qkn)
             gq_n, gk_n, gv_n = torch.autograd.grad(o_n, (q, k, v), g, retain_graph=False)
-            o_f, a_f = hba_attention_fused(q, k, v, cos, sin, cfg, summ)
+            o_f, a_f = hba_attention_fused(q, k, v, cos, sin, cfg, summ, qkn)
             gq_f, gk_f, gv_f = torch.autograd.grad(o_f, (q, k, v), g, retain_graph=False)
             d_out = (o_n - o_f).abs().max().item()
             d_aux = abs(a_n.item() - a_f.item())
@@ -539,6 +560,64 @@ def gate_kd(tol=1e-5, tiny=None, real=None, device=None):
     return ok
 
 
+@torch.no_grad()
+def gate_qknorm_math(model, cfg, tol=1e-5):
+    """qknorm=ON internal-consistency gate (docs/design.md, "Softmax length-
+    calibration"; docs/training-recipe.md, "Correctness gates"). Supersedes
+    `gate_equivalence` for qknorm=True runs -- see that gate's docstring: donor-
+    equivalence no longer holds once QKNorm deliberately changes Q/K statistics,
+    so this gate checks something else that MUST still hold: the model's actual
+    QKNorm computation matches a transparent, independently-written reference
+    implementation, and the normalized output has the exact RMS the recipe
+    depends on for boundedness.
+
+    Two checks, both blocking:
+      (a) MATH: `model.qknorms[0]`'s output on random q/k, vs a plain from-
+          scratch RMSNorm-then-scalar-gain reference written directly in this
+          gate (not calling into attention.py's own implementation) -- these
+          must agree to fp32 precision.
+      (b) BOUNDEDNESS: the post-norm per-head RMS must equal the learned gain
+          EXACTLY (RMSNorm's defining property: ||qc||=sqrt(dh)*gain_q per
+          head). This is what makes q.k/d bounded to [-gain_q*gain_k,
+          +gain_q*gain_k] regardless of head_dim (Cauchy-Schwarz on
+          ||qc||=sqrt(dh)*gain_q, ||kc||=sqrt(dh)*gain_k) -- the actual
+          property the whole recipe leans on, not just "some normalization
+          happened".
+
+    Causality (gate_causality) and naive-vs-fused agreement (gate_fused_agreement,
+    both backends built from the SAME `_content_qk` call) already exercise the
+    QKNorm path end-to-end and are run unconditionally in run_all_gates/
+    check_gates regardless of qknorm -- this gate is the QKNorm-specific piece
+    those two don't cover."""
+    dev = next(model.parameters()).device
+    B, n, Hq, Hkv, dh = 2, 37, cfg.n_heads, cfg.n_kv, cfg.head_dim
+    g = torch.Generator(device="cpu").manual_seed(20260716)
+    q = torch.randn(B, n, Hq, dh, generator=g).to(dev)
+    k = torch.randn(B, n, Hkv, dh, generator=g).to(dev)
+    qkn = model.qknorms[0]
+    with strict_fp32():
+        qc = qkn.q(q).float()
+        kc = qkn.k(k).float()
+
+        def ref(x, gain, eps):
+            xf = x.float()
+            rms = xf.pow(2).mean(-1, keepdim=True).clamp_min(eps).sqrt()
+            gshape = (1,) * (x.dim() - 2) + (gain.shape[0], 1)
+            return (xf / rms) * gain.float().view(*gshape)
+
+        qref = ref(q, qkn.q.gain, qkn.q.eps)
+        kref = ref(k, qkn.k.gain, qkn.k.eps)
+        d_math = max(float((qc - qref).abs().max()), float((kc - kref).abs().max()))
+        rms_q = qc.pow(2).mean(-1).sqrt()                              # [B,n,Hq]
+        rms_k = kc.pow(2).mean(-1).sqrt()                              # [B,n,Hkv]
+        d_bound_q = float((rms_q - qkn.q.gain.float()[None, None]).abs().max())
+        d_bound_k = float((rms_k - qkn.k.gain.float()[None, None]).abs().max())
+    ok = d_math < tol and d_bound_q < tol and d_bound_k < tol
+    log(f"[gate:qknorm-math] max|Δ vs transparent ref|={d_math:.2e} RMS-bound |Δ| "
+        f"q={d_bound_q:.2e} k={d_bound_k:.2e} (all <{tol} ? {ok})")
+    return ok
+
+
 def run_all_gates(model, tok, cfg, kd=False):
     """Run every fine-grained gate (plus the fused-vs-naive agreement gate, if
     that's the resolved backend) and return the overall pass/fail. Callers
@@ -549,8 +628,22 @@ def run_all_gates(model, tok, cfg, kd=False):
     kd: pass True only for a run that actually has donor KD enabled (heal.py's
     --kd flag, stage-2-only) -- gate_kd then runs alongside the rest; skipped
     cleanly (not even imported into the report) otherwise, since KD is an
-    opt-in stage-2 objective, not a standing part of every run."""
-    ok_e, _ = gate_equivalence(model, tok, cfg)
+    opt-in stage-2 objective, not a standing part of every run.
+
+    qknorm split (docs/design.md, "Softmax length-calibration"; docs/training-
+    recipe.md, "Correctness gates"): `gate_equivalence` (donor-equivalence) is
+    only meaningful with cfg.qknorm=False and is SKIPPED (not run, not silently
+    loosened) when qknorm is on; `gate_qknorm_math` (the qknorm=ON internal-
+    consistency check) runs in its place. Every other gate here -- causality,
+    path-equivalence, grad-isolation, fused-vs-naive agreement -- runs
+    UNCONDITIONALLY regardless of qknorm, since both attention backends route
+    through the identical `attention._content_qk` and must stay exactly
+    consistent with each other whether or not QKNorm is active."""
+    qknorm_on = bool(getattr(cfg, "qknorm", False))
+    if qknorm_on:
+        ok_e, d_e = True, None    # gate_equivalence not meaningful once QKNorm changes Q/K stats
+    else:
+        ok_e, d_e = gate_equivalence(model, tok, cfg)
     ok_c = gate_causality(model, cfg)
     ok_p = gate_path_equivalence(model, cfg)
     ok_g = gate_grad_isolation(model, cfg)
@@ -558,14 +651,17 @@ def run_all_gates(model, tok, cfg, kd=False):
     # else the tiny-config fp32 correctness check on CPU/MPS -- see that
     # gate's own docstring for why device='cpu' is the deliberate default.
     ok_ce = gate_chunked_ce(device="cuda" if DEVICE == "cuda" else None)
-    ok = ok_e and ok_c and ok_p and ok_g and ok_ce
+    ok_qk = gate_qknorm_math(model, cfg) if qknorm_on else True
+    ok = ok_e and ok_c and ok_p and ok_g and ok_ce and ok_qk
     if ok and resolve_backend(cfg) == "fused":
         ok = ok and gate_fused_agreement(model, cfg) and gate_grad_isolation(model, cfg, backend="fused")
     ok_kd = None
     if kd:
         ok_kd = gate_kd(device="cuda" if DEVICE == "cuda" else None)
         ok = ok and ok_kd
-    log(f"[gates] equivalence={ok_e} causality={ok_c} path={ok_p} gradiso={ok_g} chunked_ce={ok_ce}"
+    log(f"[gates] equivalence={'skipped(qknorm)' if qknorm_on else ok_e} causality={ok_c} "
+        f"path={ok_p} gradiso={ok_g} chunked_ce={ok_ce} "
+        f"qknorm_math={ok_qk if qknorm_on else 'n/a'}"
         + (f" kd={ok_kd}" if kd else "") + f" -> {'ALL PASS' if ok else 'FAIL'}")
     return ok
 
@@ -797,7 +893,16 @@ def gate_ddp_equivalence(cfg, world, micro_batch=1, steps=30, warmup=5, tol_loss
 def check_reference(cfg, report):
     """fp32 (tight) and bf16 (loose) HBA-equiv logits vs a shipped fp32 reference
     export (see convert.py --export-ref) -- catches wiring/precision regressions
-    when moving the code to a new machine before any real compute is committed."""
+    when moving the code to a new machine before any real compute is committed.
+
+    QKNORM RECHARACTERIZATION (docs/design.md, "Softmax length-calibration"):
+    with cfg.qknorm=True the exported hba_equiv_logits is no longer a donor-
+    equivalence reference -- it's the QKNorm'd model's OWN fp32 output, an
+    INTERNAL self-consistency check (this machine/build reproduces a prior
+    qknorm=True build's output) rather than a donor-equivalence check. Re-export
+    REF_PATH with `python -m hba.convert --export-ref` on a qknorm=True build
+    before relying on this; a pre-QKNorm reference export will not match (by
+    design) and should not be treated as a wiring regression."""
     if not os.path.exists(REF_PATH):
         report["reference"] = dict(ok=False, why=f"{REF_PATH} missing (export it with "
                                     "`python -m hba.convert --export-ref` on a reference "
@@ -819,10 +924,29 @@ def check_reference(cfg, report):
     d_donor = (cur_donor - ref_donor).abs().max().item()
     d_hba = (cur_hba - ref_hba).abs().max().item()
     d_self = (cur_hba - cur_donor).abs().max().item()
-    fp32_ok = d_donor < 5e-3 and d_hba < 5e-3 and d_self < 5e-3
-    report["reference_fp32"] = dict(ok=bool(fp32_ok), d_donor=d_donor, d_hba=d_hba, d_self=d_self,
-                                    tol=5e-3)
-    log(f"[shake:ref-fp32] donor Δ={d_donor:.2e} hba Δ={d_hba:.2e} self Δ={d_self:.2e} -> {fp32_ok}")
+    if getattr(cfg, "qknorm", False):
+        # d_self (hba vs donor) is EXPECTED to be large -- QKNorm deliberately
+        # diverges from the donor -- so it is informational only here. d_donor
+        # (this machine's raw donor forward vs the reference export's donor
+        # forward) is UNAFFECTED by qknorm (the donor itself never sees QKNorm)
+        # and stays a valid blocking wiring check. d_hba (this build's QKNorm'd
+        # equiv output vs a prior qknorm=True reference export) is the blocking
+        # self-consistency check described in this function's docstring.
+        fp32_ok = d_donor < 5e-3 and d_hba < 5e-3
+        report["reference_fp32"] = dict(ok=bool(fp32_ok), d_donor=d_donor, d_hba=d_hba,
+                                        d_self=d_self, tol=5e-3, qknorm=True,
+                                        note="d_self is informational only in qknorm mode "
+                                             "(QKNorm deliberately diverges from the donor); "
+                                             "d_hba is the blocking self-consistency check "
+                                             "against a qknorm=True reference export")
+        log(f"[shake:ref-fp32] qknorm=True: donor Δ={d_donor:.2e} (blocking) hba-vs-ref-export "
+            f"Δ={d_hba:.2e} (blocking) hba-vs-donor Δ={d_self:.2e} (informational, expected "
+            f"large) -> {fp32_ok}")
+    else:
+        fp32_ok = d_donor < 5e-3 and d_hba < 5e-3 and d_self < 5e-3
+        report["reference_fp32"] = dict(ok=bool(fp32_ok), d_donor=d_donor, d_hba=d_hba, d_self=d_self,
+                                        tol=5e-3)
+        log(f"[shake:ref-fp32] donor Δ={d_donor:.2e} hba Δ={d_hba:.2e} self Δ={d_self:.2e} -> {fp32_ok}")
     del m32; empty_cache()
 
     # bf16 precision-regime check (the healing dtype)
@@ -874,6 +998,13 @@ def check_gates(cfg, report, kd=False):
     report["path_equiv"] = dict(ok=bool(ok_p))
     report["grad_isolation"] = dict(ok=bool(ok_g))
     report["chunked_ce"] = dict(ok=bool(ok_ce))
+    # qknorm=ON internal-consistency gate (docs/design.md, "Softmax length-
+    # calibration"; see run_all_gates's docstring for the full qknorm/
+    # gate_equivalence split -- gate_equivalence itself is not run here at all,
+    # by design: check_gates never has been the donor-equivalence check, see
+    # convert.py's --gates flow for that).
+    if getattr(cfg, "qknorm", False):
+        report["qknorm_math"] = dict(ok=bool(gate_qknorm_math(m, cfg)))
     if kd:
         report["kd"] = dict(ok=bool(gate_kd(device="cuda" if DEVICE == "cuda" else None)))
     if backend == "fused":
@@ -881,7 +1012,12 @@ def check_gates(cfg, report, kd=False):
         ok_gf = gate_grad_isolation(m, cfg, backend="fused")
         report["fused_agreement"] = dict(ok=bool(ok_f))
         report["grad_isolation_fused"] = dict(ok=bool(ok_gf))
-    # G1 induction on the raw donor (equiv mode) -- short/fast (docs/evals.md, "G1")
+    # G1 induction on the raw donor (equiv mode) -- short/fast (docs/evals.md,
+    # "G1"). With cfg.qknorm=True, "equiv" mode is the model's OWN QKNorm'd
+    # full-attention limit, not the literal raw donor (init_qknorm_gains
+    # calibrates the QKNorm gains to approximately preserve the donor's own
+    # attention temperature at init -- see model.py -- so this remains a
+    # reasonable pre-healing sanity probe, just not a donor-identical one).
     from .evals import induction_probe
     acc = induction_probe(m, cfg, "equiv", lengths=(2048, 4096), reps=3, trials=16)
     g1 = max(acc.values()) >= 0.3

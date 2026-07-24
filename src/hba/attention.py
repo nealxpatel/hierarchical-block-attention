@@ -15,9 +15,10 @@ memory-capped chunked path used at arbitrary (including very long) context, with
 an optional two-level hierarchical selection.
 """
 
-import os
+import math
 
 import torch
+import torch.nn as nn
 
 from .config import DEVICE, throttle_mps
 from .summarizer import grouped_query, slot_block_scores
@@ -50,6 +51,151 @@ def yarn_theta(cfg, n):
     s = n / cfg.native_ctx
     D = cfg.head_dim
     return cfg.rope_theta * (s ** (D / (D - 2)))
+
+
+# ------------------------------------------- softmax length-calibration (QKNorm) -
+# docs/design.md, "Softmax length-calibration across candidate counts"; the
+# Inkling essay (https://idlemachines.co.uk/essays/inkling) and the Scalable-
+# Softmax paper (arXiv:2501.19399). The union softmax mixes THREE logit sources
+# per query -- NoPE sinks, NoPE routed blocks, RoPE window -- and its calibration
+# breaks as the routed candidate crowd grows with context length: raw q.k is
+# UNBOUNDED (grows with head_dim and with however large the trained Q/K
+# statistics happen to be), so as more candidates enter the softmax their summed
+# exponentials dilute a still-sharp correct answer (measured: needle retrieval
+# 0.42 -> 0.014 -> 0.0 at 4K/16K/32K heal length, dense-mode capability intact
+# throughout -- the failure is purely the union softmax's calibration, not the
+# weights or the block selection). More training dose does not fix this by
+# itself; it is architectural.
+class _HeadRMSNorm(nn.Module):
+    """RMS-normalize the last (head_dim) axis, independently per head, then apply
+    a learned PER-HEAD SCALAR gain (NOT a per-dimension elementwise affine, unlike
+    the Gemma-style RMSNorm used elsewhere in this codebase for the donor's own
+    layernorms). A scalar gain is load-bearing for the "bounded content logit"
+    property: after normalization ||x|| = sqrt(head_dim) exactly per head
+    (independent of head_dim's actual value), so a scalar gain `g` gives
+    ||gx|| = g*sqrt(head_dim) exactly, and q.k for two such vectors is provably
+    g_q*g_k*head_dim*cos(theta) -- bounded to [-g_q*g_k, +g_q*g_k] after the 1/d
+    scale below. A per-dimension gain (the standard RMSNorm affine) would turn
+    q.k into a general weighted bilinear form only loosely bounded via a
+    gain-weighted Cauchy-Schwarz, losing the exact cos(theta) characterization
+    the Inkling/SSMax recipe relies on."""
+
+    def __init__(self, n_heads, eps=1e-6):
+        super().__init__()
+        self.gain = nn.Parameter(torch.ones(n_heads))
+        self.eps = eps
+
+    def forward(self, x):
+        # x: [..., H, dh]: H must equal self.gain.shape[0].
+        xf = x.float()
+        rms = xf.pow(2).mean(-1, keepdim=True).clamp_min(self.eps).sqrt()
+        gshape = (1,) * (x.dim() - 2) + (self.gain.shape[0], 1)
+        xn = (xf / rms) * self.gain.float().view(*gshape)
+        return xn.to(x.dtype)
+
+
+class QKNorm(nn.Module):
+    """Owns one layer's q- and k-side QKNorm gains (docs/design.md, "Softmax
+    length-calibration"). q has `cfg.n_heads` heads, k has `cfg.n_kv` (GQA) --
+    separate gain vectors, but both normalized by the identical `_HeadRMSNorm`
+    recipe (RMS-normalize then scalar gain) so their scales are directly
+    comparable term-for-term in a dot product.
+
+    SHARED SCALE ACROSS THE UNION SOFTMAX (the crux for HBA -- see
+    `_content_qk` below, which is the single call site that actually wires this
+    in): this module normalizes q and k EXACTLY ONCE per layer, before either
+    the RoPE window branch or the NoPE sink/routed branch consumes them. RoPE
+    is then applied to THESE SAME normalized tensors for the window branch
+    (rotation is norm-preserving, so it does not change the
+    [-gain_q*gain_k, +gain_q*gain_k] bound), while the NoPE branches use the
+    un-rotated normalized tensors directly. Both branches therefore enter the
+    union softmax on a PROVABLY identical scale -- not a scale that training
+    merely learns to match, but one that is the same tensor, only rotated
+    differently -- because there is only one gain per head, not a separate gain
+    per branch to keep in sync."""
+
+    def __init__(self, cfg, eps=1e-6):
+        super().__init__()
+        self.q = _HeadRMSNorm(cfg.n_heads, eps=eps)
+        self.k = _HeadRMSNorm(cfg.n_kv, eps=eps)
+
+
+def content_scale(cfg, dh):
+    """The content-branch (union-softmax) logit scale. Only consulted when
+    cfg.qknorm is True -- see `_content_qk`, the sole call site; qknorm=False
+    always uses the legacy dh**-0.5 directly and never reaches this function, so
+    an irrelevant/unrecognized content_scale_mode can never affect the
+    regression path.
+
+    'inv_d' (default): 1/d. With QKNorm'd q/k this leaves the content logit at
+    gain_q*gain_k*cos(theta) -- bounded independent of head_dim, the point of
+    the recipe (docs/design.md, "Softmax length-calibration").
+    'inv_sqrt_d': legacy 1/sqrt(d), kept as an ABLATION -- QKNorm's boundedness
+    without the 1/d half of the fix, to isolate which half of the recipe does
+    the work."""
+    mode = getattr(cfg, "content_scale_mode", "inv_d")
+    if mode == "inv_d":
+        return 1.0 / dh
+    if mode == "inv_sqrt_d":
+        return dh ** -0.5
+    raise ValueError(f"unknown content_scale_mode {mode!r}")
+
+
+def log_len_tau(cfg, n):
+    """Clamped log-length temperature (docs/design.md, "Softmax length-
+    calibration"; the Inkling essay; SSMax, arXiv:2501.19399):
+
+        tau = 1 + c * log(max(n / n_cal, 1))
+
+    IDENTITY (tau=1 exactly -- log(1)=0) for any served length n <= n_cal, the
+    model's native/trained calibration length (defaults to cfg.native_ctx; see
+    HBAConfig.n_cal). Only grows beyond n_cal. tau multiplies the content scale
+    (`_content_qk`), i.e. it SHARPENS logits as n grows past n_cal (c >= 0 ->
+    tau >= 1) to counter union-softmax dilution from the growing candidate
+    crowd -- the SSMax mechanism, here applied as the EXTRAPOLATION knob for
+    serving beyond the trained/native length. Calibration WITHIN n_cal is the
+    architecture's job (QKNorm + content_scale), not this knob's -- this is why
+    it is identity there by construction, not by a separate clamp.
+
+    Only meaningful, and only ever called, when cfg.qknorm is True (see
+    `_content_qk`) -- the temperature is part of the same calibration story as
+    QKNorm; without QKNorm there is no bounded content logit for a length-
+    dependent sharpening factor to act on in a principled way, and gating it
+    here keeps qknorm=False a clean, exact regression to the pre-QKNorm code."""
+    c = getattr(cfg, "temp_c", 0.0)
+    if c == 0.0:
+        return 1.0
+    n_cal = getattr(cfg, "n_cal", None) or cfg.native_ctx
+    ratio = max(n / n_cal, 1.0)
+    return 1.0 + c * math.log(ratio)
+
+
+def _content_qk(q, k, cfg, qkn, n):
+    """The single call site that wires QKNorm + content_scale + the log-length
+    temperature into a (qc, kc, scale) triple, consumed identically by the
+    dense, fused, and eval attention backends (this identical wiring, not
+    independent per-backend implementations, is what keeps the fused-vs-naive
+    and dense-vs-eval agreement gates meaningful under QKNorm).
+
+    qknorm=False: qc is q and kc is k (the SAME tensors, no copy) and
+    scale=dh**-0.5 -- byte-identical to the pre-QKNorm code path. This is the
+    ablation/regression mode `gate_equivalence` still holds exactly under."""
+    dh = q.shape[-1]
+    if getattr(cfg, "qknorm", False):
+        qc, kc = qkn.q(q), qkn.k(k)
+        # NOTE: tau is folded into the single shared scale here, so it currently
+        # sharpens ALL union branches (window + sinks + routed) uniformly. Only
+        # the routed NoPE branch actually dilutes with length; the fixed-size
+        # window and constant sinks do not, so the principled target is
+        # routed-only sharpening. This is a deferred refinement for the
+        # beyond-native EXTRAPOLATION work -- it is inert for native-length
+        # serving (tau == 1 for n <= n_cal), so it does not affect a run that
+        # trains and serves within n_cal.
+        scale = content_scale(cfg, dh) * log_len_tau(cfg, n)
+    else:
+        qc, kc = q, k
+        scale = dh ** -0.5
+    return qc, kc, scale
 
 
 # ------------------------------------------------------ hierarchical selection -
@@ -100,27 +246,6 @@ def hier_select(qn, S0, S1, fanout, beam, kk, cand, scale):
     return top_idx, top_val, ns + b_eff * fanout
 
 
-# ------------------------------------------- eval-only NoPE softmax temperature -
-# The union softmax dilutes as the candidate crowd grows with context length
-# (docs/design.md, "Softmax calibration across candidate counts"). This is the
-# log-N temperature "assist, not fix" mitigation described there: EVAL PATH ONLY,
-# default 0.0 == strictly OFF (the guarded branch below is never entered; bit-
-# identical outputs). When c > 0, the NoPE-region logits (sinks + routed) entering
-# the union softmax are scaled by 1/tau with
-#     tau = 1 + c * log(max(N_nope / N_cal, 1))
-# where N_nope is the per-query count of NoPE keys ELIGIBLE to that query (visible
-# sinks + routed-candidate keys, from the same candidate arithmetic as routing) and
-# N_cal is the same count for the last query at heal_ctx. Identity for any query
-# whose candidate crowd is <= the heal-length crowd (i.e. for all n <= heal_ctx).
-# Never used by the train paths; no checkpoint or config dependence.
-NOPE_TEMP_C = float(os.environ.get("HBA_NOPE_TEMP_C", "0.0"))
-
-
-def set_nope_temp_c(c):
-    global NOPE_TEMP_C
-    NOPE_TEMP_C = float(c)
-
-
 # ------------------------------------------------------ HBA attention (train) --
 def _route_candidates(n, W, nb, Bk, dev):
     """cand[n, nb]: content blocks fully BEFORE the window (excluding sink block 0)
@@ -144,7 +269,7 @@ def _causal_bucket_masks(n, S, W, nb, Bk, dev):
     return m_sink, m_win, cand
 
 
-def route_topk(q, k, cfg, summ, cand):
+def route_topk(qc, kc, cfg, summ, cand):
     """Learned top-k routing, shared VERBATIM by the naive and fused train paths so
     both backends make the identical selection given identical inputs (same ops in
     the same order -> bitwise-equal scores -> equal top-k; this is what makes the
@@ -152,39 +277,56 @@ def route_topk(q, k, cfg, summ, cand):
     DETACHED q/k -- the gradient paths are disjoint: the LM loss reaches only
     q/k/v/o, the aux-KL loss reaches only the summarizer's probes/proj (docs/
     training-recipe.md, "gradient-isolation rule").
-    q:[B,n,Hq,dh]  k:[B,n,Hkv,dh]  cand:[n,nb]  ->  (sel[B,Hkv,n,nb] bool, bsc[B,Hkv,n,nb])."""
-    B, n, Hq, dh = q.shape
+
+    qc/kc: the CONTENT q/k -- already QKNorm'd (or raw, if qknorm=False) by the
+    caller's `_content_qk` -- so the routing/summarizer branch shares the exact
+    same bounded scale as the union softmax's content logits (docs/design.md,
+    "Softmax length-calibration": "apply QKNorm to the routing/summary scoring
+    too if it shares the dilution problem" -- it does, since a block-selection
+    score computed from unbounded raw q/k would drift with context length the
+    same way the union softmax's content branch used to).
+    qc:[B,n,Hq,dh]  kc:[B,n,Hkv,dh]  cand:[n,nb]  ->  (sel[B,Hkv,n,nb] bool, bsc[B,Hkv,n,nb])."""
+    B, n, Hq, dh = qc.shape
     Hkv = cfg.n_kv
     Bk = cfg.block
     nb = n // Bk
     kk = min(cfg.k_blocks, nb)
-    scale = dh ** -0.5
-    qg = grouped_query(q, cfg)                                                    # [B,Hkv,n,dh]
-    Sblk = summ.summarize(k.detach(), Bk)                                         # [B,Hkv,nb,m,dh]
+    scale = content_scale(cfg, dh) if getattr(cfg, "qknorm", False) else dh ** -0.5
+    qg = grouped_query(qc, cfg)                                                   # [B,Hkv,n,dh]
+    Sblk = summ.summarize(kc.detach(), Bk)                                        # [B,Hkv,nb,m,dh]
     bsc = slot_block_scores(qg.detach(), Sblk, scale)                             # [B,Hkv,n,nb]
     bsc = bsc.masked_fill(~cand[None, None], float("-inf"))
     top = bsc.topk(kk, dim=-1).indices                                            # [B,Hkv,n,kk]
-    sel = torch.zeros(B, Hkv, n, nb, dtype=torch.bool, device=q.device)
+    sel = torch.zeros(B, Hkv, n, nb, dtype=torch.bool, device=qc.device)
     sel.scatter_(-1, top, True)
     sel = sel & cand[None, None]
     return sel, bsc
 
 
-def hba_attention_dense(q, k, v, cos, sin, cfg, summ, equiv=False):
+def hba_attention_dense(q, k, v, cos, sin, cfg, summ, qkn, equiv=False):
     """TRAINING / dense path (GQA). q:[B,n,Hq,dh]  k,v:[B,n,Hkv,dh]. One softmax
     over the disjoint union {NoPE sinks, RoPE window, NoPE routed top-k blocks};
     block scores from the learned per-KV-head SlotSummarizer; selection is per KV
     head (grouped query), shared by the group. Returns (out[B,n,Hq,dh], aux_kl).
 
+    qkn: this layer's QKNorm (attention.QKNorm) -- see `_content_qk`, the single
+    call below that applies it (or, if cfg.qknorm is False, is a no-op that
+    reproduces the pre-QKNorm code exactly).
+
     equiv=True short-circuits to dense UNIFORM-RoPE causal attention (route-
-    everything + RoPE-everywhere limit) -- reproduces the donor's own attention
-    exactly (docs/training-recipe.md, "Equivalence gate"). aux is 0 there."""
+    everything + RoPE-everywhere limit). With qknorm=False this reproduces the
+    donor's own attention exactly (docs/training-recipe.md, "Equivalence gate").
+    With qknorm=True it instead reproduces THIS model's own full-attention limit
+    through its (now QKNorm'd) Q/K -- no longer donor-equivalent by construction
+    (see gates.gate_equivalence's docstring: that gate is meaningful only in
+    qknorm=OFF mode; gates.gate_qknorm_math is the qknorm=ON internal-consistency
+    check). aux is 0 there either way."""
     B, n, Hq, dh = q.shape
     Hkv, G = cfg.n_kv, cfg.G
-    scale = dh ** -0.5
     dev = q.device
-    qr = apply_rope(q, cos, sin).transpose(1, 2)                                  # [B,Hq,n,dh]
-    kr = apply_rope(k, cos, sin).transpose(1, 2).repeat_interleave(G, dim=1)      # [B,Hq,n,dh]
+    qc, kc, scale = _content_qk(q, k, cfg, qkn, n)
+    qr = apply_rope(qc, cos, sin).transpose(1, 2)                                 # [B,Hq,n,dh]
+    kr = apply_rope(kc, cos, sin).transpose(1, 2).repeat_interleave(G, dim=1)     # [B,Hq,n,dh]
     if equiv:
         i = torch.arange(n, device=dev)[:, None]
         j = torch.arange(n, device=dev)[None, :]
@@ -197,13 +339,13 @@ def hba_attention_dense(q, k, v, cos, sin, cfg, summ, equiv=False):
     assert n % Bk == 0, (n, Bk)
     nb = n // Bk
     kk = min(kb, nb)
-    qn = q.transpose(1, 2)                                                        # [B,Hq,n,dh]
-    kn_kv = k.transpose(1, 2)                                                     # [B,Hkv,n,dh]
+    qn = qc.transpose(1, 2)                                                       # [B,Hq,n,dh]
+    kn_kv = kc.transpose(1, 2)                                                    # [B,Hkv,n,dh]
     kn = kn_kv.repeat_interleave(G, dim=1)                                        # [B,Hq,n,dh]
     vv = v.transpose(1, 2).repeat_interleave(G, dim=1)
     # ---- routing on DETACHED q/k (grad paths disjoint: LM->qkv/o, aux->probes/proj ONLY) ----
     m_sink, m_win, cand = _causal_bucket_masks(n, S, W, nb, Bk, dev)
-    sel, bsc = route_topk(q, k, cfg, summ, cand)                                  # [B,Hkv,n,nb]
+    sel, bsc = route_topk(qc, kc, cfg, summ, cand)                                # [B,Hkv,n,nb]
     sel_q = sel.repeat_interleave(G, dim=1)                                       # [B,Hq,n,nb]
     m_rout = sel_q.repeat_interleave(Bk, dim=-1)                                  # [B,Hq,n,n]
     s_nope = torch.matmul(qn, kn.transpose(-1, -2)) * scale
@@ -367,12 +509,19 @@ def _aux_kl_chunked(q, k, bsc, cand, cfg):
     mass over candidate blocks; softmax-over-keys-then-block-sum == softmax over
     blockwise LSEs, identical math), but computed in query chunks under no_grad so
     no [B,Hq,n,n] tensor is ever materialized. Teacher math in fp32 (autocast-
-    safe); grads reach ONLY bsc (the summarizer)."""
+    safe); grads reach ONLY bsc (the summarizer).
+
+    Caller passes the CONTENT q/k (already QKNorm'd by `_content_qk`, or raw if
+    qknorm=False) -- same convention as `hba_attention_dense`'s teacher, which
+    computes pstar directly from its (also QKNorm'd) s_nope. Both teachers must
+    use the identical scale or the fused and naive paths' aux-KL would silently
+    diverge under qknorm=True."""
     B, n, Hq, dh = q.shape
     Hkv, G = cfg.n_kv, cfg.G
     Bk = cfg.block
     nb = n // Bk
-    scale = dh ** -0.5
+    scale = (content_scale(cfg, dh) * log_len_tau(cfg, n)) if getattr(cfg, "qknorm", False) \
+        else dh ** -0.5
     with torch.no_grad():
         # bmm-friendly layout: [B,Hkv,G,c,dh] @ [B,Hkv,1,dh,n] broadcasts the KV
         # head over its G query heads via stride-0 batched GEMM (no repeat_interleave copy).
@@ -400,7 +549,7 @@ def _aux_kl_chunked(q, k, bsc, cand, cfg):
     return q.new_zeros(())
 
 
-def hba_attention_fused(q, k, v, cos, sin, cfg, summ):
+def hba_attention_fused(q, k, v, cos, sin, cfg, summ, qkn):
     """TRAINING / FUSED path (GQA, FlexAttention). Same math as
     hba_attention_dense -- ONE softmax over the disjoint union {NoPE sinks, NoPE
     routed top-k blocks, RoPE window} -- obtained as the log-sum-exp merge of two
@@ -418,26 +567,32 @@ def hba_attention_fused(q, k, v, cos, sin, cfg, summ):
     every query) so lse_A is finite; region B IS empty for queries i<S (window
     excludes kv<S) -> flex returns out_B=0 rows with lse_B=-inf, and
     exp(-inf - m)=0 removes them from the merge cleanly.
+
+    qkn: this layer's QKNorm, applied via the SAME `_content_qk` helper
+    `hba_attention_dense` uses -- both branches (A, NoPE; B, RoPE) are built from
+    the identical (qc, kc, scale) triple, which is what keeps this path's output
+    bit-agreeing with the naive path under qknorm=True (gates.gate_fused_agreement).
+
     Returns (out[B,n,Hq,dh], aux_kl) -- same contract as the naive path."""
     from torch.nn.attention.flex_attention import AuxRequest
     B, n, Hq, dh = q.shape
     Bk, S, W = cfg.block, cfg.sinks, cfg.window
-    scale = dh ** -0.5
     dev = q.device
     assert n % Bk == 0, (n, Bk)
     nb = n // Bk
+    qc, kc, scale = _content_qk(q, k, cfg, qkn, n)
     cand = _route_candidates(n, W, nb, Bk, dev)
-    sel, bsc = route_topk(q, k, cfg, summ, cand)                 # identical selection to naive
+    sel, bsc = route_topk(qc, kc, cfg, summ, cand)                # identical selection to naive
     flex = _flex_fn()
     bmA = _routed_blockmask(sel, cfg, n, dev)                    # rebuilt each call (data-dep)
     bmB = _window_blockmask(n, S, W, dev)                        # cached (data-indep)
-    qA = q.transpose(1, 2)                                       # [B,Hq,n,dh]  NoPE
-    kA = k.transpose(1, 2)                                       # [B,Hkv,n,dh] (GQA: no expand)
+    qA = qc.transpose(1, 2)                                      # [B,Hq,n,dh]  NoPE
+    kA = kc.transpose(1, 2)                                      # [B,Hkv,n,dh] (GQA: no expand)
     vA = v.transpose(1, 2)
     outA, auxA = flex(qA, kA, vA, block_mask=bmA, scale=scale, enable_gqa=True,
                       return_aux=AuxRequest(lse=True))
-    qB = apply_rope(q, cos, sin).transpose(1, 2)                 # RoPE
-    kB = apply_rope(k, cos, sin).transpose(1, 2)
+    qB = apply_rope(qc, cos, sin).transpose(1, 2)                # RoPE
+    kB = apply_rope(kc, cos, sin).transpose(1, 2)
     outB, auxB = flex(qB, kB, vA, block_mask=bmB, scale=scale, enable_gqa=True,
                       return_aux=AuxRequest(lse=True))
     lseA, lseB = auxA.lse.float(), auxB.lse.float()              # [B,Hq,n] fp32
@@ -448,23 +603,34 @@ def hba_attention_fused(q, k, v, cos, sin, cfg, summ):
     out = out.to(q.dtype).transpose(1, 2)                        # [B,n,Hq,dh]
     # aux_w == 0.0 (stage 3): skip the chunked O(n^2) teacher (see hba_attention_dense note).
     aux = (q.new_zeros(()) if getattr(cfg, "aux_w", 1.0) == 0.0
-           else _aux_kl_chunked(q, k, bsc, cand, cfg))
+           else _aux_kl_chunked(qc, kc, bsc, cand, cfg))
     return out, aux
 
 
-def hba_attention_eval(q, k, v, cos, sin, cfg, summ, cap, hier=False, equiv=False):
+def hba_attention_eval(q, k, v, cos, sin, cfg, summ, qkn, cap, hier=False, equiv=False):
     """EVAL path (GQA), memory-capped chunked gather. Selection per KV head
     (grouped query), shared by the group's G query heads. hier=True uses the
     two-level hierarchy (docs/design.md, "Hierarchy") for the routed selection.
     Mathematically equal to hba_attention_dense wherever the selections agree
-    (path-equivalence gated -- see gates.py)."""
+    (path-equivalence gated -- see gates.py).
+
+    qkn: this layer's QKNorm, applied via the SAME `_content_qk` helper the
+    train paths use -- this is what "keep an eval-time path consistent with
+    training" (docs/training-recipe.md) means concretely: one shared (qc, kc,
+    scale) computation, not a separately-tuned eval-only mitigation. `scale`
+    already folds in the clamped log-length temperature (attention.log_len_tau)
+    computed from THIS call's own `n` -- identity for n <= n_cal, growing only
+    beyond it -- and is applied uniformly to sinks, window, AND routed logits
+    (the old eval-only mitigation this supersedes scaled only the NoPE sink+
+    routed logits, leaving the window branch on a different scale; folding the
+    temperature into the single shared union scale removes that asymmetry)."""
     B, n, Hq, dh = q.shape
     Hkv, G = cfg.n_kv, cfg.G
     Bk, S, W, kb = cfg.block, cfg.sinks, cfg.window, cfg.k_blocks
-    scale = dh ** -0.5
     dev = q.device
-    q_rope = apply_rope(q, cos, sin)
-    k_rope = apply_rope(k, cos, sin)
+    qc, kc, scale = _content_qk(q, k, cfg, qkn, n)
+    q_rope = apply_rope(qc, cos, sin)
+    k_rope = apply_rope(kc, cos, sin)
     if equiv:
         out = torch.empty_like(q)
         qr = q_rope.transpose(1, 2)
@@ -490,28 +656,20 @@ def hba_attention_eval(q, k, v, cos, sin, cfg, summ, cap, hier=False, equiv=Fals
     barr = torch.arange(nb, device=dev)
     woff = torch.arange(-W + 1, 1, device=dev)
     bidx = torch.arange(B, device=dev)[:, None, None]
-    Sblk = summ.summarize(k, Bk)                                                  # [B,Hkv,nb,m,dh]
-    kblk = k.view(B, nb, Bk, Hkv, dh)
+    Sblk = summ.summarize(kc, Bk)                                                 # [B,Hkv,nb,m,dh]
+    kblk = kc.view(B, nb, Bk, Hkv, dh)
     vblk = v.view(B, nb, Bk, Hkv, dh)
-    temp_c = NOPE_TEMP_C
-    if temp_c != 0.0:
-        # calibration count from the code's OWN candidate arithmetic at heal_ctx:
-        # NoPE keys eligible to the LAST heal-length query = sinks + candidate
-        # blocks * Bk (docs/design.md, "Softmax calibration").
-        _hc = cfg.heal_ctx
-        _cal_blocks = int(_route_candidates(_hc, W, _hc // Bk, Bk, dev)[-1].sum())
-        N_cal = float(S + _cal_blocks * Bk)
     it = 0
     for g in range(Hkv):                            # selection is per KV head (shared by group)
         Sh = Sblk[:, g]                             # [B,nb,m,dh]
         S1h, ns = build_super(Sh, cfg.fanout) if hier else (None, None)
-        kn_g = k[:, :, g]; kr_g = k_rope[:, :, g]; vv_g = v[:, :, g]             # [B,n,dh]
+        kn_g = kc[:, :, g]; kr_g = k_rope[:, :, g]; vv_g = v[:, :, g]            # [B,n,dh]
         knb = kblk[:, :, :, g]; vnb = vblk[:, :, :, g]                            # [B,nb,Bk,dh]
         sink_k = kn_g[:, :S]; sink_v = vv_g[:, :S]
         for hh in range(G):                         # each query head in the group
             h = g * G + hh
-            qn = q[:, :, h]; qr = q_rope[:, :, h]
-            qg = grouped_query(q, cfg)[:, g]        # [B,n,dh] grouped routing query (per KV head)
+            qn = qc[:, :, h]; qr = q_rope[:, :, h]
+            qg = grouped_query(qc, cfg)[:, g]       # [B,n,dh] grouped routing query (per KV head)
             for cs in range(0, n, chunk):
                 ce = min(n, cs + chunk); c = ce - cs
                 i = torch.arange(cs, ce, device=dev)
@@ -543,17 +701,6 @@ def hba_attention_eval(q, k, v, cos, sin, cfg, summ, cap, hier=False, equiv=Fals
                 rsc = torch.einsum("bcd,bcmd->bcm", qn[:, cs:ce], rk) * scale
                 rvalid = (~bad)[..., None].expand(B, c, kk, Bk).reshape(B, c, kk * Bk)
                 rsc = rsc.masked_fill(~rvalid, float("-inf"))
-                if temp_c != 0.0:
-                    # log-length NoPE temperature: sharpen sinks+routed logits when
-                    # this query's eligible NoPE crowd exceeds the heal-length
-                    # calibration crowd. tau = 1 exactly for all queries at
-                    # n <= heal_ctx (ratio clamped to 1); window (RoPE) logits
-                    # untouched; -inf stays -inf under the positive scale.
-                    n_nope = torch.minimum(i + 1, i.new_tensor(S)) + cand.sum(-1) * Bk    # [c]
-                    tau = 1.0 + temp_c * (n_nope.to(torch.float32) / N_cal).clamp(min=1.0).log()
-                    inv_tau = (1.0 / tau).to(ssc.dtype)[None, :, None]
-                    ssc = ssc * inv_tau
-                    rsc = rsc * inv_tau
                 allsc = torch.cat([ssc, wsc, rsc], dim=-1)
                 allsc = allsc - allsc.max(-1, keepdim=True).values.detach()
                 wgt = allsc.softmax(-1)

@@ -49,7 +49,7 @@ kept, deliberately:
   a large part of why the attention-only healing stage is cheap. Replacing it would mean
   relearning local attention — the expensive part — from scratch.
 
-Concurrent from-scratch work (Thinking Machines' Inkling) makes the other choice: a
+Concurrent from-scratch work (described in the [Inkling essay](https://idlemachines.co.uk/essays/inkling)) makes the other choice: a
 learnt, content-dependent additive distance bias over the same-sized local window, with no
 rotary embeddings anywhere. That is a defensible design when pretraining from scratch and
 plausibly more expressive, at a higher kernel cost (the bias must be materialized inside
@@ -79,7 +79,7 @@ Flat selection compares each query group against all `N` block summaries — `O(
 - **Measured speedup** (summary comparisons per query, vs flat): **5.2× at 32K, 7.9× at 64K, 10.6× at 128K.**
 - Depth generalizes: additional levels give `O(log N)` selection; two levels suffice through 128K.
 
-## Softmax calibration across candidate counts (read this before scaling context)
+## Softmax length-calibration (read this before scaling context)
 
 The union softmax has one subtlety that does not exist in dense attention: **the routed region's aggregate mass depends on how many candidate blocks compete**. Train at context `n₀` and the model calibrates its NoPE logit scale against `N₀` candidates. Serve at `2n₀` and roughly `2N₀` candidates contribute — even if each irrelevant block is only *slightly* warm, their summed exponentials dilute the softmax and can bury a still-sharp correct-answer logit.
 
@@ -91,12 +91,22 @@ This is measurable and severe. Our discriminator at 2× the trained context, sam
 | HBA path, routing off (window + sinks only) | 0.156 | ~2,300 |
 | HBA path, routing on | 0.031 | ~56,000 |
 
-The weights are perfect (dense-mode rank 1); block *selection* is also fine (oracle selection matches learned selection). The failure is purely the diluted union softmax. Two mitigations:
+The weights are perfect (dense-mode rank 1); block *selection* is also fine (oracle selection matches learned selection). The failure is purely the diluted union softmax. **More training dose does not fix this by itself** — a length-curriculum stage that dosed a longer regime moved that regime's own retrieval but left it well below the dense-mode ceiling; the miscalibration is structural, not (only) a data-coverage gap. That motivates treating it architecturally.
 
-1. **Length curriculum (primary).** Train at the mixture of lengths you intend to serve. Calibration is learned; the model must see the candidate-count regime. This is a repair-scale job (a fraction of the healing budget), not a retraining job. Spec in [training-recipe.md](training-recipe.md).
-2. **Log-N temperature (assist, not fix).** Scale the NoPE region's logits by `τ = 1 + c·log(N/N_cal)` (identity at the calibration length). At `c ≈ 0.05–0.1` this doubled accuracy and moved answer mass ~30×, but plateaued ~8× below dense-mode accuracy; larger `c` over-sharpens. Consistent with the general rule that analytic knobs for learned miscalibrations are partial. A related trained-length-clamped temperature appears in concurrent independent work on position-free long-range attention (Thinking Machines' Inkling), which we take as convergent evidence for both the phenomenon and the boundary choice — their position-aware window is also 1,024 tokens.
+### The fix: QKNorm + a bounded, shared union scale + a clamped extrapolation temperature
 
-Structural options under evaluation for the large-scale run: QK-norm with fixed scaling on the NoPE branch, which bounds content logits and makes cross-length calibration architectural rather than learned.
+The recipe below follows the [Inkling essay](https://idlemachines.co.uk/essays/inkling) and the Scalable-Softmax paper ([arXiv:2501.19399](https://arxiv.org/abs/2501.19399)), adapted to HBA's specific union-softmax structure. Three interlocking parts, implemented in `hba/attention.py` (`QKNorm`, `content_scale`, `log_len_tau`, `_content_qk`) and config-driven via `HBAConfig.qknorm` / `.content_scale_mode` / `.temp_c` / `.n_cal`:
+
+1. **QKNorm.** RMS-normalize queries and keys per head, then apply a learned **per-head SCALAR gain** (not a per-dimension elementwise affine — see `QKNorm`'s docstring for why the scalar form is load-bearing). After normalization, `||q|| = ||k|| = sqrt(dh)` exactly (times the gain), so `q·k = gain_q·gain_k·dh·cos(θ)` — a quantity bounded by the gains, independent of head_dim or however large the raw Q/K statistics happen to be.
+2. **1/d content scale (not 1/√d).** Dividing the QKNorm'd `q·k` by `dh` (not `sqrt(dh)`) leaves the content logit at `gain_q·gain_k·cos(θ) ∈ [-gain_q·gain_k, +gain_q·gain_k]` — bounded regardless of context length or candidate count, which is the actual property that fixes dilution: a bounded per-candidate logit means the union softmax's calibration doesn't have to relearn its scale every time the candidate crowd changes size.
+3. **A scale shared across the whole union, by construction, not by training.** The union softmax mixes three logit sources per query — the RoPE local window, the NoPE sinks, and the NoPE routed blocks — and *all three* must share one scale, or one branch dominates regardless of content relevance. HBA's design here is deliberately simple: QKNorm normalizes Q/K **once per layer**, before either branch consumes them. The NoPE branches (sinks, routed) use the normalized tensors directly; the RoPE window branch applies rotary embeddings to the *same* normalized tensors (rotation is norm-preserving, so it does not change the `[-gain_q·gain_k, +gain_q·gain_k]` bound). Both branches therefore enter the union softmax on a **provably** identical scale — the same normalized vectors, only rotated differently for the window — rather than two independently-scaled branches that training merely learns to match. The routing/summarizer scoring branch (which block a query selects, not the attention weight it gets once selected) shares the same QKNorm'd Q/K for the identical reason: an unbounded routing score would drift with candidate count the same way the old union softmax did, even though hard top-k selection is itself scale-invariant, the summarizer's own softmax-normalized aux-KL objective is not.
+4. **A clamped log-length temperature for extrapolation beyond the trained/native length.** `τ = 1 + c·log(max(n/n_cal, 1))`, `c ≈ 0.1`, multiplying the content scale (equivalently, scaling the query). This is **identity** (`τ=1` exactly, since `log(1)=0`) for any served length `n ≤ n_cal` — QKNorm + the bounded 1/d scale is what calibrates the softmax *within* the trained/native length; this temperature only grows past `n_cal`, sharpening logits to counter dilution when genuinely extrapolating beyond what the model was healed at. `n_cal` defaults to `native_ctx` (32,768 for the 0.5B validation donor and the primary 32K-native release target), so within-32K serving is architecture-calibrated (τ=1) and this knob only activates for longer-than-native extension.
+
+Ablation flags (`HBAConfig`): `qknorm` (default on; off reproduces the pre-QKNorm attention byte-for-byte — see `training-recipe.md`, "Correctness gates"), `content_scale_mode` (`'inv_d'` vs the legacy `'inv_sqrt_d'`, to isolate which half of the fix matters), and `temp_c` / `n_cal` for the extrapolation temperature (gated under `qknorm`; inert when `qknorm=False`).
+
+A related trained-length-clamped temperature appears in the Inkling essay's own recipe, which we take as convergent evidence for both the phenomenon and the boundary choice — their position-aware local window is also 1,024 tokens. Unlike Inkling's from-scratch design (a learnt additive distance bias inside the window, no rotary embeddings anywhere), HBA keeps window-RoPE for conversion economics (see "Design note: why the window keeps RoPE" above) — QKNorm + the shared 1/d scale is the piece of the recipe that transfers to a RoPE-window design unchanged.
+
+**Length curriculum remains necessary, not optional.** The architectural fix bounds the logits so the union softmax's calibration problem is well-posed at every length; it does not, by itself, teach the model to route and weight correctly at lengths it never trained at. Stage 3's length curriculum (`training-recipe.md`) is still how the model learns to *use* that bounded scale well beyond a single training length — the architecture and the curriculum are complementary, not substitutes.
 
 ## Complexity
 

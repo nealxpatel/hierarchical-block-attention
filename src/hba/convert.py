@@ -60,7 +60,17 @@ DISTILL_WIN_FRACS = [0.2, 0.5, 0.8]
 def export_reference(model, cfg):
     """Save fp32 donor + HBA-equiv logits on a FIXED input so gates.check_reference
     can verify a swap on a new machine reproduces this one (fp32 tight; bf16
-    loose). Run in fp32 on the reference machine."""
+    loose). Run in fp32 on the reference machine.
+
+    With cfg.qknorm=True, hba_equiv_logits is no longer a donor-equivalence
+    reference (QKNorm deliberately changes Q/K statistics away from the donor's
+    own -- docs/design.md, "Softmax length-calibration") -- it becomes the
+    QKNorm'd model's OWN fp32 output, an INTERNAL consistency check that a new
+    machine/build reproduces THIS build, not that HBA reproduces the donor. See
+    gates.check_reference's docstring for exactly which of its comparisons stay
+    blocking vs become informational under qknorm=True. Re-export whenever
+    cfg.qknorm flips (a qknorm=OFF export cannot validate a qknorm=ON build, or
+    vice versa)."""
     dev = next(model.parameters()).device
     g = torch.Generator(device="cpu").manual_seed(REF_SEED)
     ids = torch.randint(0, cfg.vocab_size, (1, REF_N), generator=g)
@@ -253,8 +263,6 @@ def main():
                          "gates/save-init flow")
     ap.add_argument("--needle-book", default=os.environ.get("HBA_NEEDLE_BOOK"),
                     help="basename (substring) of the held-out needle-eval book to EXCLUDE from distill-init harvesting")
-    ap.add_argument("--needle-book", default=os.environ.get("HBA_NEEDLE_BOOK"),
-                    help="basename substring of the held-out needle-eval book to EXCLUDE from distill-init harvesting")
     ap.add_argument("--corpus-dir", default=CORPUS_DIR,
                     help="directory of *.txt documents for --distill-init (default: "
                          "$HBA_CORPUS_DIR or <data>/corpus)")

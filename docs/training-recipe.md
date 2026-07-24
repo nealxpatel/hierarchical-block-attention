@@ -38,6 +38,27 @@ L_aux = KL( p_teacher(blocks) ‖ softmax(slot scores) )
 
 Total loss: full next-token CE through the hard top-k selected exact attention (no straight-through tricks), plus `w_aux · L_aux`.
 
+## Softmax length-calibration (QKNorm) and healing
+
+The architectural fix for union-softmax dilution (`docs/design.md`, "Softmax length-calibration": QKNorm + a bounded 1/d content scale + a shared union scale + a clamped log-length extrapolation temperature) is a **Q/K geometry change**, so it interacts with healing in ways worth stating explicitly:
+
+- **A fresh conversion is required.** QKNorm changes Q/K statistics fundamentally — the converted model can no longer reproduce the donor's own attention exactly at init, by design (that departure is the whole point). This means stage 0→1→2→3 must run fresh under `cfg.qknorm=True`; you **cannot** seed a QKNorm run from an existing pre-QKNorm checkpoint (the summarizer distill-init, the Q/K healing trajectory, and the correctness-gate reference export are all specific to one `qknorm` setting — see "Correctness gates" below).
+- **Init for healing absorption.** `hba.model.init_qknorm_gains` (called automatically by `build_hba` whenever `cfg.qknorm=True`) calibrates each layer's QKNorm gains from the **frozen donor's own** pre-RoPE Q/K RMS on a short random-token batch, so the post-QKNorm content logit starts at roughly the donor's own attention temperature (see that function's docstring for the closed-form derivation) — healing then absorbs the architecture change from a sane starting point instead of an arbitrary one, the same "don't start healing from a broken place" discipline the rest of this recipe applies elsewhere.
+- **`n_cal` is the calibration boundary, not a training-length knob.** It defaults to `native_ctx` — the donor's own native/trained context (32,768 for the 0.5B validation donor; the release target is likewise a 32K-native donor, `docs/training-recipe.md`'s Donor selection section). Within `n_cal`, QKNorm + the bounded content scale is what calibrates the union softmax — architecturally, not learned — so the log-length temperature (`HBAConfig.temp_c`) is identity there by construction. The temperature is the **extrapolation** knob: it only grows past `n_cal`, for serving beyond the model's native/trained length. This is a different job from the length curriculum below, which is still what teaches the model to *use* the routed path well at every trained length, including lengths at or under `n_cal`.
+- **CLI to run a fresh qknorm=True conversion:**
+
+  ```
+  python -m hba.convert --distill-init [--smoke]     # stage 0 (unaffected by qknorm; frozen-donor distill)
+  python -m hba.convert --gates [--smoke]             # runs gate_qknorm_math in place of gate_equivalence
+  python -m hba.convert --save-init --from-distill [--smoke]
+  python -m hba.convert --export-ref                  # re-export: qknorm=True reference is NOT donor-equivalence, see below
+  python -m hba.heal --phase stage1 --resume
+  python -m hba.heal --phase stage2 --resume
+  python -m hba.heal --phase stage3 --resume
+  ```
+
+  `HBAConfig.qknorm` defaults to `True`; pass `qknorm=False` (e.g. via a config override in a driver script) to run the ablation/regression path instead — byte-identical to the pre-QKNorm attention, with `gate_equivalence` (not `gate_qknorm_math`) as the correctness gate.
+
 ## Capability rehearsal (do not skip)
 
 **The failure this prevents:** full-parameter healing on generic text destroyed the model's induction/retrieval capability — 0.25 → 0.06 on a copy probe — **while perplexity stayed flat and the stage bought zero perplexity over the attention-only stage**. Nothing in ordinary text rewards content-agnostic copying; gradient descent trades the circuit away for a loss improvement too small to see. Perplexity is structurally blind to this. The fix (rehearsal + 4× lower LR + live probes) revived the capability within 50 training steps and held it above the donor's level for the rest of the run.
@@ -68,7 +89,7 @@ Stage 2 can optionally add a second protection alongside capability rehearsal: a
 
 ## Length curriculum (do not skip either)
 
-**The failure this prevents:** the union softmax's calibration is specific to the candidate-count regime seen in training. At 2× the healed context, the same weights retrieved perfectly in dense mode (answer rank 1) while the routed path buried the answer (rank ~56,000) — dilution by the doubled candidate crowd, not a weight or selection failure. An analytic log-N temperature recovered only a fraction of the gap: **the model must see the longer regime in training.**
+**The failure this prevents:** the union softmax's calibration is specific to the candidate-count regime seen in training. At 2× the healed context, the same weights retrieved perfectly in dense mode (answer rank 1) while the routed path buried the answer (rank ~56,000) — dilution by the doubled candidate crowd, not a weight or selection failure. An analytic log-N temperature recovered only a fraction of the gap: **the model must see the longer regime in training.** `docs/design.md`'s "Softmax length-calibration" section (QKNorm + a bounded, shared union scale) makes the calibration *within* a trained length architectural rather than learned, and adds a clamped extrapolation temperature for lengths beyond `n_cal` — but it does not replace this section: the architecture bounds the logits so calibration is well-posed at every length, it does not by itself teach the model to route and weight well at candidate-count regimes it never trained at. The length curriculum is still how that gets learned.
 
 Spec:
 
@@ -101,9 +122,10 @@ Perplexity tells you the model is a fluent language model. It tells you nothing 
 
 The routed attention path is exotic enough that silent wrongness is the default failure mode. The discipline that kept validation honest:
 
-- **Keep a naive reference oracle forever.** Every optimized path — the fused kernel, the chunked long-context evaluator — is permanently gated against a transparent naive implementation on identical inputs (our fused-vs-naive agreement: ~1e-6). The oracle is never deleted for being slow.
-- **Equivalence gate:** with routing configured to select everything, the converted model must reproduce the donor's logits (measured: max |Δ| ≈ 8e-5). This proves the swap is exact before healing changes anything.
+- **Keep a naive reference oracle forever.** Every optimized path — the fused kernel, the chunked long-context evaluator — is permanently gated against a transparent naive implementation on identical inputs (our fused-vs-naive agreement: ~1e-6, and still ~1e-4-tight with QKNorm on — see below). The oracle is never deleted for being slow.
+- **Equivalence gate (qknorm=OFF only):** with routing configured to select everything, the converted model must reproduce the donor's logits (measured: max |Δ| ≈ 8e-5). This proves the swap is exact before healing changes anything — but only in `qknorm=False` mode. With `qknorm=True`, QKNorm is a *deliberate* departure from the donor's Q/K statistics, so this equivalence no longer holds by design, and asserting it would be wrong, not merely loose. `hba.gates.run_all_gates`/`check_gates` skip `gate_equivalence` entirely when `cfg.qknorm=True` (they do not silently relax its tolerance) and run `gate_qknorm_math` in its place: an internal-consistency check that the model's own QKNorm computation matches a transparent independent reference implementation, and that the resulting per-head RMS exactly equals the learned gain (the property that makes the content logit bounded — `docs/design.md`, "Softmax length-calibration"). Causality, path-equivalence (dense vs. eval), and grad-isolation all run **unconditionally**, regardless of `qknorm` — both attention backends share one `_content_qk` call site, so these remain the load-bearing "the QKNorm path is internally consistent" checks alongside `gate_qknorm_math`.
 - **Causality gate:** perturbing future tokens must change past logits by exactly 0.0, on both train and eval paths.
 - **Gradient-isolation gate:** the exact-zero checks from the aux-loss section.
 - **Top-k discontinuity honesty:** top-k selection is discontinuous, so float-level noise can flip near-tie block picks between two correct implementations. Gate the discontinuity-free property (select-all mode) at tight tolerance, and separately bound the flip *fraction* and per-flip magnitude at the real config — don't loosen the main gate to paper over ties.
+- **Reference export is qknorm-mode-specific:** `hba.convert --export-ref` exports fp32 donor + HBA-equiv logits on a fixed input for `hba.gates.check_reference` to compare against on a new machine. With `qknorm=True`, the HBA-equiv half of that export is no longer a donor-equivalence reference — it is the QKNorm'd model's *own* fp32 output, an internal self-consistency check (does a new machine/build reproduce this one) rather than a donor-equivalence check. Re-export whenever `qknorm` flips; a `qknorm=False` export cannot validate a `qknorm=True` build or vice versa.
 - **Refuse to start:** training scripts should hard-refuse to launch unless the gates are green. Gates that can be skipped will be.

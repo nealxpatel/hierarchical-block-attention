@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .attention import hba_attention_dense, hba_attention_eval, hba_attention_fused
+from .attention import QKNorm, hba_attention_dense, hba_attention_eval, hba_attention_fused
 from .config import DEVICE, DONOR_NAME, log, resolve_backend
 from .summarizer import SlotSummarizer
 
@@ -30,6 +30,12 @@ class HBAModel(nn.Module):
         self.cfg = cfg
         self.donor = donor                      # kept as submodule -> its params are trainable
         self.summarizers = nn.ModuleList(SlotSummarizer(cfg) for _ in range(cfg.n_layers))
+        # Per-layer QKNorm gains (docs/design.md, "Softmax length-calibration").
+        # Always constructed (cheap: 2 small parameter vectors per layer) even
+        # when cfg.qknorm=False, so a checkpoint/state_dict shape is stable
+        # across the flag -- the flag only controls whether attention.py's
+        # `_content_qk` actually CALLS these modules, not whether they exist.
+        self.qknorms = nn.ModuleList(QKNorm(cfg) for _ in range(cfg.n_layers))
         self._last_aux = None
         # locate the decoder stack (Qwen2ForCausalLM.model, or any HF causal-LM with
         # the same .model/.lm_head layout)
@@ -52,6 +58,14 @@ class HBAModel(nn.Module):
             elif g == "attn":
                 for lyr in self.core.layers:
                     for p in lyr.self_attn.parameters():
+                        p.requires_grad_(True)
+                # QKNorm gains are part of the attention geometry (they act
+                # directly on Q/K before the content dot product), so they train
+                # alongside Q/K/V/O whenever "attn" is trainable -- a no-op when
+                # cfg.qknorm=False (the gains exist but attention.py never calls
+                # them, so their gradient is always exactly 0 either way).
+                for qkn in self.qknorms:
+                    for p in qkn.parameters():
                         p.requires_grad_(True)
             elif g == "norms":
                 for lyr in self.core.layers:
@@ -100,8 +114,9 @@ class HBAModel(nn.Module):
         use_ckpt = (mode == "train")
         for L, lyr in enumerate(self.core.layers):
             summ = self.summarizers[L]
+            qkn = self.qknorms[L]
 
-            def block_fn(x, lyr=lyr, summ=summ):
+            def block_fn(x, lyr=lyr, summ=summ, qkn=qkn):
                 a = lyr.input_layernorm(x)
                 q = lyr.self_attn.q_proj(a).view(B, n, Hq, dh)
                 k = lyr.self_attn.k_proj(a).view(B, n, Hkv, dh)
@@ -110,15 +125,18 @@ class HBAModel(nn.Module):
                 if mode == "train":
                     attn = (hba_attention_fused if self.attn_backend == "fused"
                             else hba_attention_dense)
-                    o, aux = attn(q, k, v, cos, sin, cfg, summ)
+                    o, aux = attn(q, k, v, cos, sin, cfg, summ, qkn)
                 elif mode == "equiv":
-                    # memory-capped chunked uniform-RoPE causal attention (== donor).
-                    # The dense equiv branch would materialize [B,Hq,n,n] (tens of
-                    # GiB at moderate context, absurd at long context), so the
-                    # donor / donor+YaRN baselines at eval lengths MUST take this path.
-                    o = hba_attention_eval(q, k, v, cos, sin, cfg, summ, cap, equiv=True)
+                    # memory-capped chunked uniform-RoPE causal attention (== donor
+                    # when cfg.qknorm=False; == this model's own QKNorm'd full-
+                    # attention limit when cfg.qknorm=True -- see hba_attention_eval's
+                    # docstring). The dense equiv branch would materialize
+                    # [B,Hq,n,n] (tens of GiB at moderate context, absurd at long
+                    # context), so the donor / donor+YaRN baselines at eval
+                    # lengths MUST take this path.
+                    o = hba_attention_eval(q, k, v, cos, sin, cfg, summ, qkn, cap, equiv=True)
                 else:
-                    o = hba_attention_eval(q, k, v, cos, sin, cfg, summ, cap,
+                    o = hba_attention_eval(q, k, v, cos, sin, cfg, summ, qkn, cap,
                                            hier=(mode == "eval_hier"))
                 o = lyr.self_attn.o_proj(o.reshape(B, n, Hq * dh))
                 x = x + o
@@ -176,9 +194,70 @@ def load_donor(dtype=None, device=None):
     return donor, tok
 
 
+@torch.no_grad()
+def init_qknorm_gains(model, cfg, n_calib=256, seed=20260716):
+    """Data-dependent QKNorm gain init (docs/design.md, "Softmax length-
+    calibration"; docs/training-recipe.md's healing-absorption init note).
+    QKNorm changes Q/K statistics fundamentally -- the converted model can no
+    longer reproduce the donor exactly at init, by design (gates.gate_equivalence
+    only holds in qknorm=OFF mode; see gates.gate_qknorm_math for the qknorm=ON
+    internal-consistency check instead). This function's job is narrower: pick a
+    starting gain so the FIRST healing step begins from a sane attention
+    temperature, not an arbitrary one, so healing absorbs the architecture change
+    from a good starting point rather than an adversarial one.
+
+    Derivation. Raw (pre-QKNorm) content logit: q.k = ||q|| ||k|| cos(theta) =
+    dh * rq * rk * cos(theta), where rq/rk are the donor's own per-(layer,head)
+    RMS of q/k (||x|| = sqrt(dh) * RMS(x)). The donor's own 1/sqrt(dh) scale
+    turns that into  sqrt(dh) * rq * rk * cos(theta) -- the donor's native logit
+    magnitude. Our post-QKNorm vectors have ||qc|| = sqrt(dh) * gain_q (RMSNorm
+    pins RMS to 1, times the gain), so qc.kc = dh * gain_q * gain_k * cos(theta);
+    the 1/dh content scale (content_scale_mode='inv_d') then gives a post-QKNorm
+    content logit of  (gain_q * gain_k) * cos(theta). Matching the two magnitudes
+    requires gain_q * gain_k = dh**0.5 * rq * rk, solved (one of many valid splits;
+    only the PRODUCT matters for the content logit's scale) by
+        gain_q[head] = dh**0.25 * rq[head]      gain_k[head] = dh**0.25 * rk[head]
+    rq/rk are measured directly from the FROZEN donor's own pre-RoPE q_proj/
+    k_proj outputs on a short random-token calibration batch (no corpus/network
+    dependency beyond the donor itself, which is already loaded) -- calibration,
+    not training: no gradient, seconds of compute, run once at model construction
+    (see build_hba)."""
+    dev = next(model.parameters()).device
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    ids = torch.randint(0, cfg.vocab_size, (1, n_calib), generator=g).to(dev)
+    Q, K, handles = {}, {}, []
+
+    def mk(store, i):
+        def hook(mod, inp, out):
+            store[i] = out.detach().float()
+        return hook
+    for i, lyr in enumerate(model.core.layers):
+        handles.append(lyr.self_attn.q_proj.register_forward_hook(mk(Q, i)))
+        handles.append(lyr.self_attn.k_proj.register_forward_hook(mk(K, i)))
+    was = model.training
+    model.eval()
+    model.donor(ids)
+    model.train(was)
+    for h in handles:
+        h.remove()
+    Hq, Hkv, dh = cfg.n_heads, cfg.n_kv, cfg.head_dim
+    for L in range(cfg.n_layers):
+        qf = Q[L].view(-1, Hq, dh)                                 # [n_calib, Hq, dh]
+        kf = K[L].view(-1, Hkv, dh)                                # [n_calib, Hkv, dh]
+        rq = qf.pow(2).mean(-1).sqrt().mean(0)                     # [Hq]  per-head RMS
+        rk = kf.pow(2).mean(-1).sqrt().mean(0)                     # [Hkv]
+        qkn = model.qknorms[L]
+        qkn.q.gain.data.copy_((dh ** 0.25) * rq.to(qkn.q.gain.dtype))
+        qkn.k.gain.data.copy_((dh ** 0.25) * rk.to(qkn.k.gain.dtype))
+    log(f"[qknorm-init] calibrated {cfg.n_layers} layers' QKNorm gains from the frozen donor's "
+        f"own pre-RoPE Q/K RMS on {n_calib} random-token calibration positions")
+
+
 def build_hba(cfg=None, dtype=None, device=None):
     from .config import HBAConfig
     cfg = cfg or HBAConfig()
     donor, tok = load_donor(dtype=dtype, device=device)
     model = HBAModel(donor, cfg).to(device or DEVICE)
+    if getattr(cfg, "qknorm", False):
+        init_qknorm_gains(model, cfg)
     return model, tok, cfg

@@ -14,9 +14,14 @@ Public API (the pieces most callers need):
   hba_attention_fused          -- the FlexAttention LSE-merge path (train path)
   hba_attention_eval           -- the chunked eval path (flat or hierarchical)
   rope_tables, yarn_theta      -- RoPE utilities
+  QKNorm                       -- per-layer QKNorm gains (docs/design.md,
+                                  "Softmax length-calibration")
+  content_scale, log_len_tau   -- the shared union-softmax content scale and the
+                                  clamped log-length extrapolation temperature
 """
 
-from .attention import hba_attention_dense, hba_attention_eval, hba_attention_fused, rope_tables, yarn_theta
+from .attention import (QKNorm, content_scale, hba_attention_dense, hba_attention_eval,
+                        hba_attention_fused, log_len_tau, rope_tables, yarn_theta)
 from .config import DEVICE, HBAConfig, resolve_backend, smoke_config
 from .model import HBAModel, build_hba, load_donor
 from .summarizer import SlotSummarizer
@@ -33,6 +38,9 @@ __all__ = [
     "hba_attention_eval",
     "rope_tables",
     "yarn_theta",
+    "QKNorm",
+    "content_scale",
+    "log_len_tau",
     "resolve_backend",
     "DEVICE",
 ]
