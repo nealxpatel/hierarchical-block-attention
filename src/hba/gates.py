@@ -685,22 +685,39 @@ def gate_rank_consistency(model, cfg, device=None, tol=1e-6):
     return ok
 
 
-def gate_nccl_bandwidth(size_gb=2.0, min_bus_gbs=6.0, device=None):
-    """Blocking (design: multi-GPU shakedown gate 7). All-reduces a ~size_gb
-    buffer and reports measured BUS bandwidth; aborts below `min_bus_gbs`
-    (consumer-GPU host-staged all-reduce -- no P2P -- realistically lands
-    6-12 GB/s; this microbench is the authority on the box's actual comm
-    reality, not a theoretical peak). GPU/NCCL-only in any meaningful sense --
-    no-op True at world=1."""
+def gate_nccl_bandwidth(size_gb=2.0, min_bus_gbs=6.0, device=None, advisory=True):
+    """Multi-GPU shakedown microbench (design: gate 7). All-reduces a ~size_gb
+    buffer and reports measured BUS bandwidth (consumer-GPU host-staged
+    all-reduce -- no P2P -- realistically lands ~5-12 GB/s).
+
+    ADVISORY by default: the aggregate-throughput scaling-efficiency check in
+    check_training (>= 0.75 at world > 1) is the AUTHORITATIVE comm gate -- it
+    directly measures whether training actually scales, which is the only thing
+    this microbench proxies. Empirically the proxy was too strict: a host that
+    measured 4.73 GB/s here (below the original 6 GB/s hard floor) went on to
+    scale a full-parameter, heavy-comm stage-3 heal at ~0.8 efficiency, because
+    DDP bucketing overlaps the all-reduce with the backward. So a low microbench
+    with a healthy scaling-efficiency is a false alarm, not a lemon. When
+    advisory (the shakedown default), this WARNS below `min_bus_gbs` but returns
+    True; a genuinely comm-bound box is caught by the scaling-efficiency gate.
+    Pass advisory=False to restore a hard floor (e.g. a standalone comm probe).
+    No-op True at world=1."""
     if not dist_util.is_distributed():
         log("[gate:nccl-bw] world=1 -- trivially OK (nothing to all-reduce across)")
         return True
     result = dist_util.allreduce_bandwidth_microbench(size_gb=size_gb, device=device)
-    ok = result["bus_bw_gbs"] >= min_bus_gbs
+    meets = result["bus_bw_gbs"] >= min_bus_gbs
     log(f"[gate:nccl-bw] {size_gb}GB all-reduce across world={result['world']}: "
         f"{result['seconds']:.3f}s bus_bw={result['bus_bw_gbs']:.2f}GB/s "
-        f"(>= {min_bus_gbs} ? {ok})")
-    return ok
+        f"(>= {min_bus_gbs} ? {meets}{'; ADVISORY -- scaling-efficiency gate governs' if advisory else ''})")
+    if advisory:
+        if not meets:
+            log(f"[gate:nccl-bw] WARNING: {result['bus_bw_gbs']:.2f}GB/s is below the "
+                f"{min_bus_gbs}GB/s advisory floor -- NOT failing the shakedown (the "
+                "aggregate-throughput scaling-efficiency gate in check_training is the "
+                "authoritative comm gate). Watch the aggregate tok/s during training.")
+        return True
+    return meets
 
 
 def gate_ddp_equivalence(cfg, world, micro_batch=1, steps=30, warmup=5, tol_loss=1e-3,
@@ -1138,7 +1155,10 @@ def run_shakedown(cfg, planned_tps=5000.0, steps=150, stage="all", fast=False,
             if dist_util.is_distributed():
                 m = dist_util.wrap_ddp(m, local_rank, "fp32")
             del m; empty_cache()
-            report["nccl_bandwidth"] = dict(ok=bool(gate_nccl_bandwidth(
+            # advisory (default): warns on a low microbench but does not fail the
+            # shakedown -- the scaling-efficiency gate in check_training governs
+            # (see gate_nccl_bandwidth's docstring for the empirical basis).
+            report["nccl_bandwidth_advisory"] = dict(ok=bool(gate_nccl_bandwidth(
                 device=DEVICE if DEVICE == "cuda" else None)))
     if stage in ("all", "train"):
         check_training(cfg, planned_tps, steps, report, fast=fast,
