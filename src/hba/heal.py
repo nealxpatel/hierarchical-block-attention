@@ -16,6 +16,16 @@ module implements stages 1-3; stage 0 (distill-init) lives in convert.py.
           rehearsal") -- rehearsal + a 4x-lower LR than a naive full-param LR is
           what prevents that, and IS this stage's recipe; there is no
           unrehearsed full-parameter variant in this codebase.
+
+          Optionally, stage2 can also add donor KD (`--kd`): a full-logit KL
+          between the student's next-token distribution and a FROZEN, separately
+          -loaded copy of the original donor (see hba.kd's module docstring for
+          the loss formulation, and hba.gates.gate_kd for its correctness gate).
+          KD is ADDITIVE to rehearsal, not a replacement for it: rehearsal
+          protects enumerated capabilities the fam-data mix exercises; KD
+          protects the donor's WHOLE next-token distribution at every position,
+          whether or not a probe happens to exercise it. Off by default; see
+          docs/training-recipe.md's stage-2 section for the full rationale.
   stage3  length-curriculum extension: continues from the finished stage2
           checkpoint at a deterministic per-step mixed-context cycle (short:
           medium:long steps), summarizers FROZEN and the aux-KL teacher OFF
@@ -53,6 +63,7 @@ correctness gates pass (or a live ES-2 tombstone is present -- see above).
 Usage (on a training box):
   python -m hba.heal --phase stage1 --resume
   python -m hba.heal --phase stage2 --resume
+  python -m hba.heal --phase stage2 --resume --kd --kd-weight 1.0 --kd-temp 1.0  # + donor KD
   python -m hba.heal --phase stage3 --resume   # length-curriculum heal (mixed ctx, aux OFF)
   python -m hba.heal --phase stage1 --smoke    # tiny, CPU/MPS plumbing
 """
@@ -70,11 +81,13 @@ import torch
 
 from .attention import rope_tables
 from .chunked_ce import chunked_cross_entropy
-from .config import (COMPUTE_DTYPE, DATA, DEVICE, INIT_PATH, RESULTS, HBAConfig, empty_cache,
-                     log, resolve_backend, save_ckpt_atomic, smoke_config)
+from .kd import chunked_kd_kl
+from .config import (COMPUTE_DTYPE, DATA, DEVICE, DONOR_NAME, INIT_PATH, RESULTS, HBAConfig,
+                     empty_cache, log, resolve_backend, save_ckpt_atomic, smoke_config)
 from .fam_data import FamMixer
-from .gates import gate_causality, gate_fused_agreement, gate_grad_isolation, gate_path_equivalence
-from .model import build_hba
+from .gates import (gate_causality, gate_fused_agreement, gate_grad_isolation, gate_kd,
+                    gate_path_equivalence)
+from .model import build_hba, load_donor
 from . import dist_util
 from . import early_stop
 from . import probes as capability_probes
@@ -219,7 +232,7 @@ def make_opt(model, lr):
                               {"params": nodecay, "weight_decay": 0.0}], lr=lr, betas=(0.9, 0.95))
 
 
-def _sig(cfg, phase_tokens=None, ctx_schedule=None, comm_dtype=None):
+def _sig(cfg, phase_tokens=None, ctx_schedule=None, comm_dtype=None, kd=None):
     s = {k: getattr(cfg, k) for k in ("n_layers", "n_heads", "n_kv", "head_dim", "block",
                                       "window", "sinks", "k_blocks", "slots", "heal_ctx")}
     # The RESOLVED attention backend is part of the run identity (fused and naive
@@ -259,6 +272,19 @@ def _sig(cfg, phase_tokens=None, ctx_schedule=None, comm_dtype=None):
     # relaunched at world=1, 4, or 8, as long as global_tokens_per_step matches).
     if comm_dtype is not None:
         s["comm_dtype"] = comm_dtype
+    # kd: donor KD (this module's --kd/--kd-weight/--kd-temp) changes the
+    # training OBJECTIVE, not just a runtime knob -- a stage-2 checkpoint
+    # trained with the extra donor-KD loss term and one trained without it are
+    # different recipes and must never silently resume into each other (the
+    # same reasoning as comm_dtype/attn_backend above). Included only for
+    # phases where KD is even applicable (train() passes kd=None for stage1/
+    # stage3), so those phases' signatures are byte-identical to before this
+    # field existed. For stage2, this is ALWAYS present (even when KD is off,
+    # as {"on": False}) so a KD run and a non-KD run of stage2 differ in
+    # signature -- not just a KD-on run differing from a pre-KD-feature
+    # checkpoint.
+    if kd is not None:
+        s["kd"] = kd
     return s
 
 
@@ -298,7 +324,7 @@ def _data_guards(phase, tokens, smoke, allow_small, shakedown=False):
 
 def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_small=False,
           shakedown=False, probe_every=None, warmup_steps=0, rank=0, world=1, local_rank=0,
-          tps_out=None):
+          tps_out=None, kd=False, kd_weight=1.0, kd_temp=1.0):
     """Returns 'complete' | 'done' | 'guard' (wall-clock guard hit; NOT finished).
 
     warmup_steps: INTERNAL (threaded from gates.check_training's --fast profile
@@ -337,7 +363,17 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
     firings, checkpoint/milestone/guard notices) are rank-0-only below, to avoid
     `world`-way duplicate spam under torchrun -- one-time setup lines above stay
     unrestricted (small volume; seeing them from every rank is a useful sanity
-    check that all ranks agree on the schedule)."""
+    check that all ranks agree on the schedule).
+
+    kd/kd_weight/kd_temp: donor knowledge-distillation (see hba.kd's module
+    docstring for the loss itself). STAGE-2 ONLY: stage1 barely moves the
+    donor's weights (attention-only) so there is little to distill against
+    yet, and stage3's dense-teacher forward is O(n^2) at the length-curriculum
+    context lengths -- the exact reason `cfg.aux_w` is forced to 0 there too
+    (see PHASES["stage3"]'s comment). A caller passing kd=True for any phase
+    other than stage2 gets a hard refusal below, not a silent ignore -- "KD
+    changes the objective" is exactly the kind of silent-drift this module
+    refuses by default elsewhere (see _sig's docstring comment on kd)."""
     def rlog(*a):
         if rank == 0:
             log(*a)
@@ -354,9 +390,32 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
             "phase. Diagnose the collapse first (docs/evals.md's discriminator ladder localizes "
             "retrieval failures in minutes), then delete the tombstone deliberately once addressed.")
         sys.exit(1)
+    # Donor KD is stage-2-only (see this function's docstring) -- refuse rather
+    # than silently ignore --kd on stage1/stage3 (main() already refuses this
+    # earlier at the CLI level for a plain `python -m hba.heal` invocation; this
+    # is the belt-and-suspenders copy for any other caller of train() directly,
+    # e.g. gates.check_training).
+    kd_on = bool(kd)
+    if kd_on and phase != "stage2":
+        log(f"ABORT: --kd was requested for phase={phase}, but donor KD is STAGE-2-ONLY "
+            "(stage1 barely moves the donor's weights; stage3's dense-teacher forward is "
+            "O(n^2)-unaffordable at the length-curriculum context lengths, the same reason "
+            "cfg.aux_w is forced to 0 there). Rerun with --phase stage2, or drop --kd.")
+        sys.exit(1)
     p = PHASES[phase]
     comm_dtype = p.get("comm_dtype", "fp32")
     mixed = "ctx_cycle" in p
+    assert not (kd_on and mixed), f"[{phase}] donor KD requested on a mixed-length phase -- " \
+        "should have been refused above"
+    # kd_sig: recorded in _sig (below) ONLY when KD is actually on (stage2), so a
+    # rehearsal-only stage2 checkpoint and a rehearsal+KD stage2 checkpoint never
+    # silently resume into each other. When KD is OFF, kd_sig is None -- a KD-off
+    # stage2 run is the SAME recipe as a pre-KD-feature stage2 run, so its
+    # signature stays byte-identical to before this feature existed (otherwise an
+    # in-flight rehearsal-only stage2 checkpoint would refuse to resume the moment
+    # this feature merged). None for stage1/stage3 too (KD isn't applicable there).
+    kd_sig = (dict(on=True, weight=round(kd_weight, 6), temp=round(kd_temp, 6))
+              if (kd_on and phase == "stage2") else None)
     ckpt_path = os.path.join(RESULTS, f"heal_{phase}{'_smoke' if smoke else ''}.pt")
     if mixed:
         cycle = tuple(p["ctx_cycle"])
@@ -472,7 +531,7 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
         # paper over (it would just overwrite a bad rank's params with rank 0's,
         # masking exactly the torn-read failure mode this guards against).
         ck = torch.load(ckpt_path, map_location=DEVICE)
-        if ck.get("cfg_sig") == _sig(cfg, p["tokens"], sig_sched, comm_dtype):
+        if ck.get("cfg_sig") == _sig(cfg, p["tokens"], sig_sched, comm_dtype, kd_sig):
             model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); step0 = ck["step"]
             if ck.get("done"):
                 log(f"[{phase}] already complete at step {step0}"); return "complete"
@@ -506,6 +565,26 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
     if dist_util.is_distributed():
         model = dist_util.wrap_ddp(model, local_rank, comm_dtype)
     raw = dist_util.raw_model(model)
+
+    # Donor-KD teacher: a SEPARATE, frozen, freshly-loaded copy of the original
+    # donor -- NOT `raw.donor` (that submodule is reused BY REFERENCE inside the
+    # student and is one of the trainable={..., "embed"} groups in stage2, so it
+    # drifts under training; using it as the teacher would make the target move
+    # along with the student, which isn't distillation, just a no-op consistency
+    # loss). Loaded fresh from the same DONOR_NAME the rest of the codebase uses
+    # (see model.load_donor), eval() + requires_grad_(False), at COMPUTE_DTYPE
+    # (bf16 on CUDA, matching the student's autocast compute dtype; fp32 on
+    # MPS/CPU) -- at 0.5B this is ~1GB with no grad/optimizer state, co-resident
+    # on the same device as the student for the pilot (see hba.kd's module
+    # docstring for why a larger donor would need a different placement).
+    teacher = None
+    if kd_on:
+        teacher, _ = load_donor(dtype=COMPUTE_DTYPE, device=DEVICE)
+        teacher.eval()
+        teacher.requires_grad_(False)
+        rlog(f"[{phase}] donor KD ENABLED: frozen teacher ({DONOR_NAME}) loaded fresh at "
+            f"dtype={COMPUTE_DTYPE}, kd_weight={kd_weight} kd_temp={kd_temp} -- additive to "
+            "rehearsal, not a replacement (see this module's docstring)")
 
     base_seed = cfg.seed if hasattr(cfg, "seed") else 0
     stream = fam = None
@@ -567,7 +646,7 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
         dist_util.barrier()
         if rank == 0:
             save_ckpt_atomic({"model": raw.state_dict(), "opt": opt.state_dict(), "step": step,
-                              "done": done, "cfg_sig": _sig(cfg, p["tokens"], sig_sched, comm_dtype),
+                              "done": done, "cfg_sig": _sig(cfg, p["tokens"], sig_sched, comm_dtype, kd_sig),
                               "phase": phase, "tok_seen": tok_seen}, ckpt_path)
         dist_util.barrier()
 
@@ -616,7 +695,7 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
             g["lr"] = lr
         model.train()
         opt.zero_grad(set_to_none=True)
-        loss_v = aux_v = 0.0
+        loss_v = aux_v = kd_v = 0.0
         if mixed:
             c_s = cycle[step % len(cycle)]
             mb_s, ga_s = ctx_micro[c_s]
@@ -661,7 +740,10 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
                     else:
                         # chunked CE here too: recompute-in-backward keeps the peak
                         # at one chunk's fp32 logits instead of the full [B*n, V]
-                        # tensor (the micro-batch ceiling; see chunked_ce.py).
+                        # tensor (the micro-batch ceiling; see chunked_ce.py). This
+                        # ONE student forward (return_hidden=True) feeds BOTH the
+                        # CE below AND, when KD is on, the KD loss right after --
+                        # the student is never run twice for the two losses.
                         hidden = model(inp, cos_s, sin_s, cap, mode="train",
                                        return_hidden=True)
                         aux = raw._last_aux
@@ -669,10 +751,24 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
                         loss_lm = chunked_cross_entropy(hidden, raw.lm_head.weight,
                                                         tgt, bias=raw.lm_head.bias,
                                                         chunk_size=1024)
-                    loss = loss_lm + cfg.aux_w * aux
+                        kd = hidden.new_zeros(())
+                        if kd_on:
+                            # Teacher forward: the frozen, separately-loaded donor's
+                            # OWN dense attention, under no_grad -- the extra cost
+                            # this stage-2 option adds (one dense donor forward per
+                            # micro-step; see hba.kd's module docstring for why the
+                            # teacher must be this frozen copy, not raw.donor).
+                            with torch.no_grad():
+                                teacher_logits = teacher(inp).logits
+                            kd = chunked_kd_kl(hidden, teacher_logits, raw.lm_head.weight, tgt,
+                                              bias=raw.lm_head.bias, temperature=kd_temp,
+                                              chunk_size=1024)
+                    loss = loss_lm + cfg.aux_w * aux + (kd_weight * kd if kd_on else 0.0)
                 (loss / ga_s).backward()
             loss_v += float(loss_lm.detach()) / ga_s
             aux_v += float(aux.detach()) / ga_s
+            if kd_on:
+                kd_v += float(kd.detach()) / ga_s
             tok_seen += inp.numel()
         # Grad clip AFTER the final synced backward (the summarizer aux-loss
         # gradient-isolation property -- gates.gate_grad_isolation -- is per-rank
@@ -710,7 +806,7 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
                     if rank == 0:
                         save_ckpt_atomic({"model": raw.state_dict(), "opt": opt.state_dict(),
                                           "step": step + 1, "done": False,
-                                          "cfg_sig": _sig(cfg, p["tokens"], sig_sched, comm_dtype),
+                                          "cfg_sig": _sig(cfg, p["tokens"], sig_sched, comm_dtype, kd_sig),
                                           "phase": phase, "tok_seen": tok_seen,
                                           "milestone_pct": pct}, mpath)
                         log(f"[{phase}] milestone checkpoint {pct}% ({tok_seen/1e6:.0f}M tok) -> {mpath}")
@@ -745,9 +841,10 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
                     fam_s = "  [" + " ".join(parts) + "]"
                 ctx_s_ = f" ctx {c_s}" if mixed else ""
                 wtag = f" world={world}" if world > 1 else ""
+                kd_s = f" kd {kd_v:.4f}" if kd_on else ""
                 log(f"[{phase}] step {step:6d}/{total_steps}{ctx_s_} lm {loss_v:.4f} ppl "
-                    f"{math.exp(min(20, loss_v)):.2f} aux {aux_v:.4f} tok/s {tps:6.0f}{wtag} lr {lr:.2e} "
-                    f"tok {tok_seen/1e6:.0f}M elapsed {el/3600:.2f}h{fam_s}")
+                    f"{math.exp(min(20, loss_v)):.2f} aux {aux_v:.4f}{kd_s} tok/s {tps:6.0f}{wtag} "
+                    f"lr {lr:.2e} tok {tok_seen/1e6:.0f}M elapsed {el/3600:.2f}h{fam_s}")
 
         # ---- collective control flow (design: "ALL control flow is step-based or
         # rank-0-broadcast -- NEVER rank-local wall-clock") ----------------------
@@ -781,6 +878,14 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
                 val_loss = panel_out.get("val_loss_fixed", float("nan"))
                 firing = dict(step=step, tokens=tok_seen, accs=accs, n_trials=n_trials,
                              val_loss=val_loss, wall_s=round(time.time() - t_p, 2))
+                # kd: the most recent step's training-loss KD value, logged
+                # alongside the panel firing purely for visibility (early_stop.py's
+                # rules never key off it -- see that module's firing-schema
+                # docstring, unchanged here). Omitted entirely when KD is off, so
+                # a non-KD run's probe log is byte-identical to before this
+                # feature existed.
+                if kd_on:
+                    firing["kd"] = kd_v
                 early_stop.append_probe_log(probe_log_path, firing)
                 probe_history.append(firing)
                 msg = " ".join(f"{k}={v:.3f}" for k, v in accs.items())
@@ -792,7 +897,7 @@ def train(cfg, phase, resume, micro_batch, grad_accum, budget_s, smoke, allow_sm
                     best_panel_mean = pm
                     save_ckpt_atomic({"model": raw.state_dict(), "opt": opt.state_dict(),
                                       "step": step + 1, "done": False,
-                                      "cfg_sig": _sig(cfg, p["tokens"], sig_sched, comm_dtype),
+                                      "cfg_sig": _sig(cfg, p["tokens"], sig_sched, comm_dtype, kd_sig),
                                       "phase": phase,
                                       "tok_seen": tok_seen, "panel_mean": pm}, best_ckpt_path)
                     log(f"[{phase}] new best-panel checkpoint (mean={pm:.3f}) -> {best_ckpt_path}")
@@ -914,6 +1019,19 @@ def main():
     ap.add_argument("--attn-backend", choices=["naive", "fused"], default=None,
                     help="train-path attention backend (default: cfg.attn_backend = fused). "
                          "naive = the materialized-scores correctness oracle (markedly slower).")
+    ap.add_argument("--kd", action="store_true",
+                    help="enable donor knowledge-distillation (STAGE-2 ONLY): a full-logit KL "
+                         "between the student's next-token distribution and a frozen, "
+                         "separately-loaded copy of the original donor, ADDITIVE to capability "
+                         "rehearsal (not a replacement) -- see hba.kd's module docstring and "
+                         "docs/training-recipe.md's stage-2 section. Refused (not ignored) on "
+                         "stage1/stage3. Off by default.")
+    ap.add_argument("--kd-weight", type=float, default=1.0,
+                    help="weight on the donor-KD loss term (loss = loss_lm + cfg.aux_w * aux + "
+                         "kd_weight * kd_loss when --kd is set). Default 1.0.")
+    ap.add_argument("--kd-temp", type=float, default=1.0,
+                    help="softmax temperature T for donor KD (see hba.kd's module docstring for "
+                         "the T^2 rescaling this implies). Default 1.0 (no softening).")
     args = ap.parse_args()
 
     # Multi-GPU setup FIRST, before any CUDA allocation: torch.cuda.set_device
@@ -984,6 +1102,15 @@ def _heal_main(args, rank, world, local_rank):
     log(f"heal device={DEVICE} phase={args.phase} smoke={args.smoke} dtype={COMPUTE_DTYPE} "
         f"attn_backend={resolve_backend(cfg)} rank={rank}/{world} local_rank={local_rank}")
 
+    # Donor KD is stage-2-only -- fail fast here (before gates/donor loading),
+    # not just inside train() (train() re-checks this too for any other caller;
+    # see its docstring -- same "belt only, not the only place it's enforced"
+    # pattern as the ES-2/data-sanity checks right below).
+    if args.kd and args.phase != "stage2":
+        log(f"ABORT: --kd was passed with --phase {args.phase}, but donor KD is STAGE-2-ONLY "
+            "(see heal.train's docstring for why). Rerun with --phase stage2, or drop --kd.")
+        sys.exit(1)
+
     # ES-2 tombstone: fail fast, before spending any time on gates/donor loading
     # (train() re-checks this too -- see its docstring -- so this is belt only,
     # not the only place it's enforced).
@@ -1016,6 +1143,12 @@ def _heal_main(args, rank, world, local_rank):
             # the fused backend must agree with the naive oracle + keep gradient isolation
             ok = (gate_fused_agreement(gmodel, gcfg)
                   and gate_grad_isolation(gmodel, gcfg, backend="fused"))
+        if ok and args.kd:
+            # Donor-KD's own correctness gate (chunked_kd_kl vs the reference_kd_kl
+            # oracle) -- run ONLY when --kd is set (opt-in objective; see
+            # gate_kd's docstring), so a plain rehearsal-only run pays nothing
+            # extra here.
+            ok = gate_kd(device="cuda" if DEVICE == "cuda" else None)
         del gmodel
         empty_cache()
         if not ok:
@@ -1033,7 +1166,8 @@ def _heal_main(args, rank, world, local_rank):
 
     status = train(cfg, args.phase, args.resume, micro_batch, grad_accum, budget_s, args.smoke,
                    allow_small=args.allow_small_corpus, shakedown=args.shakedown,
-                   probe_every=args.probe_every, rank=rank, world=world, local_rank=local_rank)
+                   probe_every=args.probe_every, rank=rank, world=world, local_rank=local_rank,
+                   kd=args.kd, kd_weight=args.kd_weight, kd_temp=args.kd_temp)
     if status == "guard":
         log(f"[{args.phase}] NOT finished (wall-clock guard) -- rerun with --resume")
         sys.exit(3)

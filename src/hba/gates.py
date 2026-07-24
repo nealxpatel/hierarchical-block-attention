@@ -38,6 +38,7 @@ import torch
 
 from .attention import _route_candidates, hba_attention_dense, hba_attention_fused, rope_tables
 from .chunked_ce import chunked_cross_entropy, reference_cross_entropy
+from .kd import chunked_kd_kl, reference_kd_kl
 from .config import (COMPUTE_DTYPE, DATA, DEVICE, INIT_PATH, REF_PATH, RESULTS, empty_cache, log,
                      resolve_backend, smoke_config)
 from .fam_data import FamMixer
@@ -409,12 +410,146 @@ def gate_chunked_ce(tol=1e-6, tiny=None, real=None, device=None):
     return ok
 
 
-def run_all_gates(model, tok, cfg):
+def gate_kd(tol=1e-5, tiny=None, real=None, device=None):
+    """hba.kd.chunked_kd_kl's recompute-in-backward must be BIT-HONEST against
+    hba.kd.reference_kd_kl -- the same rigor gate_chunked_ce applies to
+    chunked_cross_entropy, and for the same reason: (a) the two scalar KD
+    losses must agree to `tol`, AND (b) every gradient -- into the student
+    hidden-state input as well as the lm_head weight -- must agree to `tol`.
+    Checked at both T=1 and T=2 (the T^2 rescaling is itself part of what must
+    round-trip correctly through chunking; see hba.kd's module docstring).
+
+    Only wired into run_all_gates/check_gates when the caller has KD enabled
+    for the run (heal.py's --kd flag) -- unlike gate_chunked_ce (always on,
+    since chunked CE is the unconditional training-loss path), donor KD is an
+    opt-in stage-2 objective, so this gate is skipped cleanly when KD is off
+    rather than paying its cost on every run.
+
+    Runs in fp32 on CPU by default, tiny/deliberately-uneven dims (chunk_size
+    does not divide n) -- seconds of compute. Pass `device='cuda'` explicitly,
+    plus optionally `real` (a dict of B/n/d/V/chunk_size), to additionally run
+    a real-dims memory check: chunked_kd_kl's peak CUDA allocation must stay
+    meaningfully below an unchunked reference call's peak, using the same
+    empirical both-paths-peak comparison gate_chunked_ce uses (not a
+    peak-vs-bare-bytes threshold) -- see that gate's docstring for why."""
+    dev = device or "cpu"
+    tiny = tiny or dict(B=2, n=50, d=16, V=24, chunk_size=13, ignore_frac=0.15)
+    B, n, d, V, chunk_size = tiny["B"], tiny["n"], tiny["d"], tiny["V"], tiny["chunk_size"]
+    ignore_frac = tiny.get("ignore_frac", 0.0)
+    g = torch.Generator(device="cpu").manual_seed(0)
+    hidden0 = torch.randn(B, n, d, generator=g)
+    weight0 = torch.randn(V, d, generator=g)
+    bias0 = torch.randn(V, generator=g)
+    teacher_logits0 = torch.randn(B, n, V, generator=g)
+    labels = torch.randint(0, V, (B, n), generator=g)
+    if ignore_frac > 0:
+        mask = torch.rand(B, n, generator=g) < ignore_frac
+        labels = labels.masked_fill(mask, -100)
+
+    def _leaf(t):
+        return t.clone().to(dev).requires_grad_(True)
+
+    lbl = labels.to(dev)
+    teacher_logits = teacher_logits0.to(dev)
+
+    ok_correct = True
+    for T in (1.0, 2.0):
+        h_ref, w_ref, b_ref = _leaf(hidden0), _leaf(weight0), _leaf(bias0)
+        h_ch, w_ch, b_ch = _leaf(hidden0), _leaf(weight0), _leaf(bias0)
+
+        loss_ref = reference_kd_kl(h_ref, teacher_logits, w_ref, lbl, bias=b_ref, temperature=T)
+        loss_ref.backward()
+        loss_ch = chunked_kd_kl(h_ch, teacher_logits, w_ch, lbl, bias=b_ch, temperature=T,
+                                chunk_size=chunk_size)
+        loss_ch.backward()
+
+        d_loss = abs(float(loss_ref.detach()) - float(loss_ch.detach()))
+        d_h = (h_ref.grad - h_ch.grad).abs().max().item()
+        d_w = (w_ref.grad - w_ch.grad).abs().max().item()
+        d_b = (b_ref.grad - b_ch.grad).abs().max().item()
+        ok = d_loss < tol and d_h < tol and d_w < tol and d_b < tol
+        ok_correct = ok_correct and ok
+        log(f"[gate:kd] T={T} dims B={B} n={n} d={d} V={V} chunk={chunk_size} device={dev} "
+            f"|Δloss|={d_loss:.2e} |Δgrad_hidden|={d_h:.2e} |Δgrad_weight|={d_w:.2e} "
+            f"|Δgrad_bias|={d_b:.2e} (all <{tol} ? {ok})")
+
+    # Sanity: student logits == teacher logits -> KD loss == 0 exactly (KL of a
+    # distribution with itself), at T=1 and T=2. Forced by an identity lm_head
+    # (weight=I, bias=0) so student_logits = F.linear(hidden, I, 0) = hidden,
+    # and setting hidden = teacher_logits directly.
+    Vid = 12
+    gi = torch.Generator(device="cpu").manual_seed(1)
+    same_logits = torch.randn(2, 20, Vid, generator=gi).to(dev)
+    eye = torch.eye(Vid, device=dev)
+    zero_bias = torch.zeros(Vid, device=dev)
+    lbl_id = torch.randint(0, Vid, (2, 20), generator=gi).to(dev)
+    ok_zero = True
+    for T in (1.0, 2.0):
+        z_ref = reference_kd_kl(same_logits, same_logits, eye, lbl_id, bias=zero_bias, temperature=T)
+        z_ch = chunked_kd_kl(same_logits, same_logits, eye, lbl_id, bias=zero_bias, temperature=T,
+                             chunk_size=9)
+        this_ok = abs(float(z_ref)) < 1e-4 and abs(float(z_ch)) < 1e-4
+        ok_zero = ok_zero and this_ok
+        log(f"[gate:kd] student==teacher sanity @ T={T}: ref={float(z_ref):.2e} "
+            f"chunked={float(z_ch):.2e} (both ~0 ? {this_ok})")
+
+    ok_mem = True
+    if dev == "cuda":
+        real = real or dict(B=4, n=4096, d=896, V=151936, chunk_size=1024)
+        Br, nr, dr, Vr, csr = real["B"], real["n"], real["d"], real["V"], real["chunk_size"]
+
+        def _peak(fn):
+            h = torch.randn(Br, nr, dr, device=dev, requires_grad=True)
+            w = torch.randn(Vr, dr, device=dev, requires_grad=True)
+            t = torch.randn(Br, nr, Vr, device=dev)
+            lab = torch.randint(0, Vr, (Br, nr), device=dev)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(dev)
+            loss = fn(h, w, t, lab)
+            loss.backward()
+            torch.cuda.synchronize()
+            p = torch.cuda.max_memory_allocated(dev)
+            del h, w, t, lab, loss
+            empty_cache()
+            return p
+
+        peak_ch = _peak(lambda h, w, t, lab: chunked_kd_kl(h, t, w, lab, chunk_size=csr))
+        try:
+            peak_un = _peak(lambda h, w, t, lab: reference_kd_kl(h, t, w, lab))
+            saving = peak_un - peak_ch
+            one_chunk_logits_bytes = Br * csr * Vr * 4
+            full_logits_bytes = Br * nr * Vr * 4
+            theo_saving = full_logits_bytes - one_chunk_logits_bytes
+            ok_mem = peak_ch < peak_un and saving > 0.5 * theo_saving
+            log(f"[gate:kd] GPU memory check: real dims B={Br} n={nr} d={dr} V={Vr} chunk={csr} "
+                f"-> chunked_peak={peak_ch/2**30:.2f}GiB unchunked_peak={peak_un/2**30:.2f}GiB "
+                f"saving={saving/2**30:.2f}GiB (> 0.5*theo {theo_saving/2**30/2:.2f}GiB ? {ok_mem})")
+        except torch.cuda.OutOfMemoryError:
+            empty_cache()
+            ok_mem = True
+            log(f"[gate:kd] GPU memory check: unchunked reference OOM'd at real dims (B={Br} "
+                f"n={nr} V={Vr}) while chunked_peak={peak_ch/2**30:.2f}GiB succeeded -- chunking "
+                f"is load-bearing here -> {ok_mem}")
+    else:
+        log(f"[gate:kd] memory check SKIPPED (GPU-only; device={dev}) -- correctness (loss+grad "
+            "equality + student==teacher sanity) is the check that ran")
+
+    ok = ok_correct and ok_zero and ok_mem
+    log(f"[gate:kd] -> {ok}")
+    return ok
+
+
+def run_all_gates(model, tok, cfg, kd=False):
     """Run every fine-grained gate (plus the fused-vs-naive agreement gate, if
     that's the resolved backend) and return the overall pass/fail. Callers
     (convert.py, heal.py) refuse to proceed unless this returns True --
     "training scripts should hard-refuse to launch unless the gates are green"
-    (docs/training-recipe.md)."""
+    (docs/training-recipe.md).
+
+    kd: pass True only for a run that actually has donor KD enabled (heal.py's
+    --kd flag, stage-2-only) -- gate_kd then runs alongside the rest; skipped
+    cleanly (not even imported into the report) otherwise, since KD is an
+    opt-in stage-2 objective, not a standing part of every run."""
     ok_e, _ = gate_equivalence(model, tok, cfg)
     ok_c = gate_causality(model, cfg)
     ok_p = gate_path_equivalence(model, cfg)
@@ -426,8 +561,12 @@ def run_all_gates(model, tok, cfg):
     ok = ok_e and ok_c and ok_p and ok_g and ok_ce
     if ok and resolve_backend(cfg) == "fused":
         ok = ok and gate_fused_agreement(model, cfg) and gate_grad_isolation(model, cfg, backend="fused")
-    log(f"[gates] equivalence={ok_e} causality={ok_c} path={ok_p} gradiso={ok_g} chunked_ce={ok_ce} -> "
-        f"{'ALL PASS' if ok else 'FAIL'}")
+    ok_kd = None
+    if kd:
+        ok_kd = gate_kd(device="cuda" if DEVICE == "cuda" else None)
+        ok = ok and ok_kd
+    log(f"[gates] equivalence={ok_e} causality={ok_c} path={ok_p} gradiso={ok_g} chunked_ce={ok_ce}"
+        + (f" kd={ok_kd}" if kd else "") + f" -> {'ALL PASS' if ok else 'FAIL'}")
     return ok
 
 
@@ -699,7 +838,10 @@ def check_reference(cfg, report):
         report["reference_bf16"] = dict(ok=True, skipped=f"device={DEVICE} (bf16 regime is CUDA-only)")
 
 
-def check_gates(cfg, report):
+def check_gates(cfg, report, kd=False):
+    """kd: True only for a shakedown run that wants the donor-KD gate included
+    (see gate_kd / run_all_gates's `kd` parameter) -- skipped cleanly, with no
+    report entry at all, when False (the default; KD is opt-in)."""
     m, tok, cfg = build_hba(cfg, dtype=torch.float32)
     backend = resolve_backend(cfg)
     # With cfg.attn_backend='fused' (the default), gate_causality's train-path
@@ -715,6 +857,8 @@ def check_gates(cfg, report):
     report["path_equiv"] = dict(ok=bool(ok_p))
     report["grad_isolation"] = dict(ok=bool(ok_g))
     report["chunked_ce"] = dict(ok=bool(ok_ce))
+    if kd:
+        report["kd"] = dict(ok=bool(gate_kd(device="cuda" if DEVICE == "cuda" else None)))
     if backend == "fused":
         ok_f = gate_fused_agreement(m, cfg)
         ok_gf = gate_grad_isolation(m, cfg, backend="fused")
