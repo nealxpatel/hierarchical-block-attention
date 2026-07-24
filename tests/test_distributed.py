@@ -168,12 +168,12 @@ def test_stage3_reshard_assertion_names_the_failing_ctx():
     """S5 fix: heal.train's stage-3 world-size reshard must name WHICH
     curriculum ctx length failed (not just dist_util.assert_valid_world_config's
     generic (windows_per_step, micro_B, world) mismatch). world=3 does not
-    divide PHASES['stage3']['ctx_micro'][4096]'s micro_B*accum = 2*16 = 32
-    evenly (32 % (2*3) != 0), so this must raise naming ctx=4096 specifically.
-    This runs before heal.train ever calls build_hba (the mixed-length reshard
-    is the first substantial thing train() does for a mixed phase), so no
-    donor download / network access is needed."""
-    with pytest.raises(AssertionError, match=r"ctx=4096.*micro_B=2.*accum=16.*world=3"):
+    divide PHASES['stage3']['ctx_micro'][4096]'s windows_per_step=32 with
+    micro_B=4 evenly (32 % (4*3) != 0), so this must raise naming ctx=4096
+    specifically. This runs before heal.train ever calls build_hba (the
+    mixed-length reshard is the first substantial thing train() does for a mixed
+    phase), so no donor download / network access is needed."""
+    with pytest.raises(AssertionError, match=r"ctx=4096.*micro_B=4.*accum=8.*world=3"):
         heal.train(HBAConfig(), "stage3", resume=False, micro_batch=1, grad_accum=1,
                   budget_s=1, smoke=True, world=3)
 
