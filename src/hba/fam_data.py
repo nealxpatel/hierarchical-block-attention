@@ -175,11 +175,20 @@ class FamMixer:
         L = len(row)
         V = self.cfg.vocab_size
         target = int(rng.uniform(self._lo, self._hi) * L)
+        # Cap pairs/window PROPORTIONALLY to window length so the realized
+        # rehearsal DENSITY is uniform across curriculum lengths. `target` already
+        # scales with L (frac*L), but a FIXED cap makes density fall ~1/L: at the
+        # 4096 base length 8 pairs ~= `frac`, but at 32K the same 8 pairs is only
+        # ~frac/8 (measured: 2.5% at 4K -> 0.36% at 32K). Scaling the cap (and the
+        # placement-attempt budget) by L/4096 keeps every length near `frac`.
+        # <= 4096 is unchanged (max(8,...)), so stage-1/2 behavior is identical.
+        max_pairs = max(8, round(8 * L / 4096))
+        max_attempts = max(64, round(64 * L / 4096))
         occupied = np.zeros(L, dtype=bool)
         planted = 0
         npairs = 0
         attempts = 0
-        while planted < target and npairs < 8 and attempts < 64:
+        while planted < target and npairs < max_pairs and attempts < max_attempts:
             attempts += 1
             got = self._place_pair(row, occupied, rng, L, V)
             if got > 0:

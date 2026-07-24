@@ -109,7 +109,7 @@ GLOBAL_TOKENS_PER_STEP = 131072
 # the single-process (m, b) pair (see fam_data.FamMixer._rng's docstring) --
 # required to make plants world-size-invariant, but it silently changes what a
 # pre-existing checkpoint would resume onto, hence the bump (see _sig below).
-STREAM_VERSION = 2
+STREAM_VERSION = 3   # 3: rehearsal pair-cap scales with window length (length-uniform density)
 
 # Per-stage token budgets and LRs (continued pretraining on a pretrained donor ->
 # small LRs, no from-scratch warmup blowups). Ratios match docs/training-
